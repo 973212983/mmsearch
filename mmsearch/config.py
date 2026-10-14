@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +28,10 @@ MMPROJ_NAME = os.environ.get("MMSEARCH_MMPROJ", "mmproj-F16.gguf")
 MODEL_SIZES = {"embeddinggemma-2-Q8_0.gguf": 309855520, "mmproj-F16.gguf": 980895232}
 HF_ENDPOINTS = [("https://huggingface.co", "Hugging Face"), ("https://hf-mirror.com", "hf-mirror（国内镜像）")]
 MODEL_DIRS = [APP_DIR / "models", DATA_DIR / "models"]
+# 模型来源：official = 官方仓库（文件名可用上面的环境变量换量化）；repo = 其他 Hugging Face 仓库；
+# local = 用户指定的本地 GGUF 文件（绝对路径）。设置里官方来源只存 kind，环境变量改了也能生效
+OFFICIAL_SOURCE = {"kind": "repo", "repo": GGUF_REPO, "model": GGUF_NAME, "mmproj": MMPROJ_NAME}
+_REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 
 CTX_PER_SLOT = 8192  # 模型最大上下文，所有模态共享
 PARALLEL = 2  # 两个槽位：索引进行中查询也不用排队等整段视频
@@ -41,6 +46,7 @@ DEFAULT_SETTINGS = {
     "auto_index": True,
     "view": "grid",
     "hf_endpoint": HF_ENDPOINTS[0][0],
+    "model_source": {"kind": "official"},
     "theme": "system",
     "hotkey": "alt+space",
     "autohide": True,
@@ -51,29 +57,96 @@ DEFAULT_SETTINGS = {
 }
 
 
-def find_model(name: str) -> Path | None:
-    for d in MODEL_DIRS:
-        if (d / name).is_file():
-            return d / name
-    return None
+_source: dict = dict(OFFICIAL_SOURCE)
+
+
+def set_model_source(src: dict | None):
+    """切换当前模型来源（启动时和设置里更换模型时调用）。"""
+    global _source
+    _source = dict(OFFICIAL_SOURCE if not src or src.get("kind") == "official" else src)
+
+
+def model_source() -> dict:
+    """实际生效的来源（official 已展开成官方仓库和文件名）。"""
+    return dict(_source)
+
+
+def check_model_source(src: dict) -> str:
+    """校验用户填写的来源，返回错误说明（空串表示没问题）。"""
+    kind = src.get("kind")
+    if kind == "official":
+        return ""
+    model, mmproj = str(src.get("model") or "").strip(), str(src.get("mmproj") or "").strip()
+    if kind == "repo":
+        if not _REPO_RE.match(str(src.get("repo") or "").strip()):
+            return "仓库名应形如 作者/仓库名"
+        for name in (model, mmproj):
+            if not name.lower().endswith(".gguf") or ".." in name.replace("\\", "/").split("/") or name.startswith("/"):
+                return f"文件名应是仓库里的 .gguf 文件：{name or '（空）'}"
+    elif kind == "local":
+        for path in (model, mmproj):
+            if not path.lower().endswith(".gguf") or not Path(path).is_absolute():
+                return f"请选择本地的 .gguf 文件：{path or '（未选择）'}"
+    else:
+        return "未知的模型来源"
+    if model == mmproj:
+        return "模型文件和 mmproj 文件不能是同一个"
+    return ""
+
+
+def _repo_subdir(repo: str) -> str:
+    """非官方仓库下载到 models/<作者>__<仓库>/，免得同名文件（如 mmproj-F16.gguf）互相覆盖。"""
+    return "" if repo == GGUF_REPO else repo.replace("/", "__")
+
+
+def model_files() -> dict[str, Path | None]:
+    """当前来源下 {"model": 路径, "mmproj": 路径}，找不到的为 None。"""
+    out: dict[str, Path | None] = {}
+    for role in ("model", "mmproj"):
+        value = str(_source.get(role) or "")
+        if _source.get("kind") == "local":
+            p = Path(value)
+            out[role] = p if value and p.is_file() else None
+            continue
+        name = value.replace("\\", "/").rsplit("/", 1)[-1]
+        sub = _repo_subdir(_source.get("repo", ""))
+        out[role] = next((d / sub / name for d in MODEL_DIRS if name and (d / sub / name).is_file()), None)
+    return out
 
 
 def model_download_dir() -> Path:
-    """优先放到程序目录（便携），不可写时放到数据目录。"""
+    """优先放到程序目录（便携），不可写时放到数据目录；非官方仓库再分子目录。"""
+    sub = _repo_subdir(_source.get("repo", ""))
     d = MODEL_DIRS[0]
     try:
         d.mkdir(parents=True, exist_ok=True)
         probe = d / ".write_test"
         probe.write_bytes(b"")
         probe.unlink()
-        return d
     except OSError:
-        MODEL_DIRS[1].mkdir(parents=True, exist_ok=True)
-        return MODEL_DIRS[1]
+        d = MODEL_DIRS[1]
+    (d / sub).mkdir(parents=True, exist_ok=True)
+    return d / sub
+
+
+def known_size(name: str) -> int:
+    """官方仓库文件的已知大小（用来校验下载）；其他来源不知道，返回 0。"""
+    official = _source.get("kind") == "repo" and _source.get("repo") == GGUF_REPO
+    return MODEL_SIZES.get(name, 0) if official else 0
 
 
 def missing_models() -> list[str]:
-    return [n for n in (GGUF_NAME, MMPROJ_NAME) if find_model(n) is None]
+    """缺少的文件（仓库来源是仓库内文件名，本地来源是路径）。"""
+    found = model_files()
+    return [str(_source.get(role) or role) for role in ("model", "mmproj") if found[role] is None]
+
+
+def model_fingerprint() -> str:
+    """索引库记录的模型标识：换了模型（哪怕只是换量化）旧向量就不能和新查询混用。"""
+    parts = []
+    for role, p in model_files().items():
+        parts.append(f"{role}={p.name}:{p.stat().st_size}" if p else f"{role}=?")
+    return ";".join(parts)
 
 
 FULL_DIM = 768

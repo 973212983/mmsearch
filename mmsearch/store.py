@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS items(
     vec BLOB NOT NULL            -- 768 x float16
 );
 CREATE INDEX IF NOT EXISTS idx_items_file ON items(file_id);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);  -- 如 model：建索引所用模型的指纹
 CREATE INDEX IF NOT EXISTS idx_files_error ON files(path) WHERE error IS NOT NULL;
 """
 
@@ -286,6 +287,16 @@ class VectorStore:
         """删除失败记录，下次索引时重新处理。"""
         with self.lock:
             self.db.execute("DELETE FROM files WHERE error IS NOT NULL")
+            self.db.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        with self.lock:
+            row = self.db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)", (key, value))
             self.db.commit()
 
     def clear(self, modalities: set[str] | None = None):

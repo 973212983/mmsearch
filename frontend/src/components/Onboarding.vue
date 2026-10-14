@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
 import Logo from './Logo.vue'
+import ModelSource from './ModelSource.vue'
 import { S } from '../store'
 import { call, on } from '../api'
 
@@ -9,7 +10,11 @@ const endpoint = ref(S.settings.hf_endpoint)
 const state = ref('idle') // idle | running | paused | error
 const prog = ref({ done: 0, total: 0, speed: 0 })
 const error = ref('')
+const src = computed(() => S.settings.model_source || { kind: 'official' })
+const isOfficialRepo = computed(() => src.value.kind === 'official' || src.value.repo === S.boot.official_source.repo)
+// 只有官方仓库的文件大小是已知的
 const totalGB = computed(() => (S.missing.reduce((a, n) => a + (S.boot.model_sizes?.[n] || 0), 0) / 1024 ** 3).toFixed(1))
+const other = ref(src.value.kind === 'local') // 本地文件丢了：直接让用户重新选
 const pct = computed(() => (prog.value.total ? (prog.value.done / prog.value.total) * 100 : 0))
 const eta = computed(() => {
   const { done, total, speed } = prog.value
@@ -36,9 +41,19 @@ function start() {
   <div class="ob">
     <div class="drag pywebview-drag-region" />
     <Logo :size="52" />
-    <h1>开始之前，下载一次 AI 模型</h1>
-    <p>MMSearch 在本机理解文本、图片、音频和视频，需要约 {{ totalGB }} GB 的模型文件。<br />下载后完全离线运行，你的文件不会离开这台电脑。</p>
+    <template v-if="src.kind === 'local'">
+      <h1>找不到模型文件</h1>
+      <p>之前选择的本地模型文件被移动或删除了，请重新选择，或改用官方模型。</p>
+    </template>
+    <template v-else>
+      <h1>开始之前，下载一次 AI 模型</h1>
+      <p v-if="isOfficialRepo">MMSearch 在本机理解文本、图片、音频和视频，需要约 {{ totalGB }} GB 的模型文件。<br />下载后完全离线运行，你的文件不会离开这台电脑。</p>
+      <p v-else>将从 <b>{{ src.repo }}</b> 下载 {{ S.missing.join('、') }}。<br />下载后完全离线运行，你的文件不会离开这台电脑。</p>
+    </template>
 
+    <div v-if="other" class="other"><ModelSource @done="other = src.kind === 'local' && S.missing.length > 0" /></div>
+
+    <template v-if="src.kind !== 'local'">
     <div class="src">
       <span>下载源</span>
       <div class="seg">
@@ -60,12 +75,14 @@ function start() {
       <Icon :name="state === 'running' ? 'pause' : 'download'" :size="16" />
       {{ state === 'running' ? '暂停' : state === 'idle' ? '下载并开始' : '继续下载' }}
     </button>
+    </template>
+    <button v-if="!other && state !== 'running'" class="quit" @click="other = true">使用其他模型…</button>
     <button class="quit" @click="call('quit')">退出</button>
   </div>
 </template>
 
 <style scoped>
-.ob { position: relative; height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 0 120px; text-align: center; animation: fade-in .2s; }
+.ob { position: relative; height: 100%; overflow-y: auto; display: flex; flex-direction: column; align-items: center; justify-content: safe center; padding: 24px 120px; text-align: center; animation: fade-in .2s; }
 .drag { position: absolute; inset: 0 0 auto; height: 48px; }
 h1 { margin: 20px 0 8px; font: 600 22px var(--font-display); }
 p { margin: 0; color: var(--text-2); font-size: 13.5px; line-height: 1.75; }
@@ -82,4 +99,5 @@ p { margin: 0; color: var(--text-2); font-size: 13.5px; line-height: 1.75; }
 .go { height: 38px; padding: 0 22px; margin-top: 20px; font-size: 14px; }
 .quit { margin-top: 10px; border: none; background: none; color: var(--text-3); font-size: 12.5px; }
 .quit:hover { color: var(--text); }
+.other { width: 100%; max-width: 520px; margin-top: 22px; padding: 14px 16px; border-radius: 10px; background: var(--raise); }
 </style>

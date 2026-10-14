@@ -1,11 +1,18 @@
 <script setup>
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import Icon from './Icon.vue'
+import ModelSource from './ModelSource.vue'
 import { S, saveSettings, toast, applyBackground, pickBackground, clearBackground } from '../store'
 import { call } from '../api'
 
 // 每项改动立即生效并保存（像系统设置一样），不需要“保存”按钮，按 Esc 返回也不会丢
 const confirm = ref('')
+const editModel = ref(false)
+const modelLabel = computed(() => {
+  const m = S.settings.model_source || { kind: 'official' }
+  if (m.kind === 'local') return `本地文件 · ${m.model.split(/[\\/]/).pop()}`
+  return m.kind === 'repo' ? `${m.repo} · ${m.model}` : `官方 · ${S.boot.official_source.model}`
+})
 const recording = ref(false)
 const DEVICES = [['auto', '自动'], ['vulkan', 'GPU'], ['cpu', 'CPU']]
 const THEMES = [['system', '跟随系统'], ['dark', '深色'], ['light', '浅色']]
@@ -113,6 +120,11 @@ async function clear(which) {
 
     <div class="group">
       <div class="row">
+        <div><b>模型</b><span class="path">{{ modelLabel }}</span></div>
+        <button class="btn" @click="editModel = !editModel">{{ editModel ? '收起' : '更换…' }}</button>
+      </div>
+      <div v-if="editModel" class="row sub"><ModelSource @done="editModel = false" /></div>
+      <div class="row">
         <div><b>推理设备</b><span>自动会优先使用显卡（Vulkan），失败时改用 CPU；切换后模型会重新加载</span></div>
         <div class="seg"><button v-for="[k, t] in DEVICES" :key="k" :class="{ on: S.settings.backend === k }" @click="S.settings.backend !== k && set({ backend: k })">{{ t }}</button></div>
       </div>
@@ -144,7 +156,7 @@ async function clear(which) {
       </div>
     </div>
 
-    <p class="about">MMSearch {{ S.boot.version }} · EmbeddingGemma 2（Google DeepMind，Apache 2.0）· llama.cpp · 数据只保存在本机</p>
+    <p class="about">MMSearch {{ S.boot.version }} · 默认模型 EmbeddingGemma 2（Google DeepMind）· llama.cpp · 数据只保存在本机</p>
   </div>
 </template>
 
@@ -160,6 +172,7 @@ h2 { margin: 0; font: 600 18px var(--font-display); }
 .row b { font-size: 13.5px; font-weight: 500; }
 .row span { font-size: 12px; color: var(--text-3); }
 .path { user-select: text; word-break: break-all; }
+.row.sub { padding: 12px 14px 14px; }
 .btns { display: flex; gap: 6px; flex: none; align-items: center; }
 .bg-thumb { width: 34px; height: 34px; border-radius: 6px; object-fit: cover; border: 1px solid var(--line-2); flex: none; }
 .rng { appearance: none; -webkit-appearance: none; width: 150px; height: 20px; margin: 0; background: transparent; flex: none; }

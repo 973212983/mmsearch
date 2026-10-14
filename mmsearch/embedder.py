@@ -152,8 +152,8 @@ class LlamaServer:
     def _start(self, backend: str, exe: Path, epoch: int):
         self.port = _free_port()
         ctx = config.CTX_PER_SLOT
-        args = [str(exe), "-m", str(config.find_model(config.GGUF_NAME)),
-                "--mmproj", str(config.find_model(config.MMPROJ_NAME)),
+        files = config.model_files()
+        args = [str(exe), "-m", str(files["model"]), "--mmproj", str(files["mmproj"]),
                 "--embeddings", "--pooling", "mean",
                 "-c", str(ctx * config.PARALLEL), "-b", str(ctx), "-ub", str(ctx),
                 "--parallel", str(config.PARALLEL), "--host", "127.0.0.1", "--port", str(self.port),
@@ -280,7 +280,10 @@ class Embedder:
             except (urllib.error.URLError, OSError) as e:
                 raise EmbedError(f"llama-server 无响应：{e}") from e
             v = np.array([x["embedding"] for x in sorted(d["data"], key=lambda x: x["index"])], np.float32)
-            if v.shape[1] != config.FULL_DIM or not np.isfinite(v).all():
+            if v.shape[1] != config.FULL_DIM:
+                raise EmbedError(f"模型输出 {v.shape[1]} 维向量，MMSearch 需要 {config.FULL_DIM} 维"
+                                 "（请使用 EmbeddingGemma 2 系列的 GGUF）")
+            if not np.isfinite(v).all():
                 raise EmbedError(f"异常向量 shape={v.shape}")
             out.append(v / np.linalg.norm(v, axis=1, keepdims=True))
         return np.concatenate(out) if out else np.zeros((0, config.FULL_DIM), np.float32)

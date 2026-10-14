@@ -67,13 +67,25 @@ powershell -ExecutionPolicy Bypass -File setup.ps1   # 安装依赖、llama.cpp 
 
 为什么不用 PyTorch：同一台机器上 PyTorch CPU fp32 处理一张图约 30 秒，文本查询约 0.7 秒；llama.cpp 用核显的 Vulkan 后端快 5–20 倍，而且客户端不需要安装 torch。
 
+## 使用其他模型
+
+在「设置 → 模型 → 更换…」（首次启动的下载页也有「使用其他模型…」）可以选择：
+
+- **官方模型**：`unsloth/embeddinggemma-2-GGUF`，默认文件名见下方环境变量。
+- **其他仓库**：Hugging Face 上的任意仓库，填写 `作者/仓库名`、模型文件名和 mmproj 文件名（可以带仓库内子目录），沿用设置里的下载源。文件下载到 `models/<作者>__<仓库>/`，不会覆盖官方模型。
+- **本地文件**：直接选择本机已有的模型 GGUF 和 mmproj GGUF，不会复制。
+
+要求：必须是 EmbeddingGemma 2 系列（其他量化、微调或镜像），输出 768 维向量，并且带对应的 mmproj，因为检索流程依赖它的任务前缀和 Matryoshka 维度。维度不符时会在启动模型时报错。
+
+索引库会记录建索引所用的模型（文件名 + 大小）。换成不同的模型后，模型加载完成时会自动清空并用新模型重建索引，因为不同模型的向量不能混用。
+
 ## 可调参数（环境变量）
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MMSEARCH_HOME` | `~/.mmsearch` | 索引库、设置、llama-server 日志 |
-| `MMSEARCH_GGUF` | `embeddinggemma-2-Q8_0.gguf` | 文本模型，可换 `UD-Q4_K_XL` 等（用 `setup.ps1 -Quant` 下载） |
-| `MMSEARCH_MMPROJ` | `mmproj-F16.gguf` | 视觉/音频编码器；核显上 F16 比 Q8_0 快约 40% |
+| `MMSEARCH_GGUF` | `embeddinggemma-2-Q8_0.gguf` | 官方来源使用的文本模型，可换 `UD-Q4_K_XL` 等（用 `setup.ps1 -Quant` 下载） |
+| `MMSEARCH_MMPROJ` | `mmproj-F16.gguf` | 官方来源使用的视觉/音频编码器；核显上 F16 比 Q8_0 快约 40% |
 | `MMSEARCH_IMAGE_TOKENS` | `280` | 每张图片/帧的视觉 token 预算；设为 `70` 大约快 2 倍，细节会少一些 |
 | `MMSEARCH_LLAMA_ARGS` | 空 | 追加给 llama-server 的参数 |
 

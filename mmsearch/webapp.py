@@ -50,6 +50,10 @@ class Api:
 
     def __init__(self):
         self._settings = config.load_settings()
+        src = self._settings.get("model_source")
+        if not isinstance(src, dict) or config.check_model_source(src) or src == config.OFFICIAL_SOURCE:
+            src = self._settings["model_source"] = {"kind": "official"}  # 被手改坏了，或旧版写入的展开形式
+        config.set_model_source(src)
         self._store = VectorStore()
         self._media = MediaServer(self._store)
         self._server = LlamaServer(self._settings["backend"], self._settings["image_tokens"])
@@ -93,6 +97,7 @@ class Api:
         return {"version": config.APP_VERSION, "settings": self._settings, "missing": config.missing_models(),
                 "hotkey_ok": bool(self._hotkey.current), "autostart": shell.get_autostart(),
                 "model_sizes": config.MODEL_SIZES, "endpoints": config.HF_ENDPOINTS,
+                "official_source": config.OFFICIAL_SOURCE,
                 "token_presets": config.IMAGE_TOKEN_PRESETS, "data_dir": str(config.DATA_DIR),
                 "bg_url": self._bg_url(), "glass_ok": shell.blur_ok(),
                 "model": self._model, "index": self._index_state, **self.overview()}
@@ -123,7 +128,8 @@ class Api:
                 self._model = {"state": "ready", "device": self._server.device, "error": "",
                                "secs": round(time.time() - t, 1)}
                 self._emit("model", self._model)
-                if self._settings["auto_index"] or self._reindex:
+                rebuilt = self._check_index_model()
+                if self._settings["auto_index"] or self._reindex or rebuilt:
                     self.start_index()
             except Exception as e:
                 if gen != self._model_gen:
@@ -133,6 +139,48 @@ class Api:
                 self._emit("model", self._model)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _check_index_model(self) -> bool:
+        """索引是用别的模型建的：旧向量和新模型的查询不在同一空间，清空后重建。返回是否清空了。"""
+        fp = config.model_fingerprint()
+        old = self._store.get_meta("model")
+        self._store.set_meta("model", fp)
+        if old is None or old == fp or not self._store.stats()["items"]:
+            return False  # 旧版索引库没有记录：当作就是当前模型建的
+        self._store.clear()
+        self._last_vec = None
+        self._emit("overview", self.overview())
+        self._toast("已更换模型，正在用新模型重建索引")
+        return True
+
+    def set_model_source(self, src: dict) -> dict:
+        """设置页 / 引导页更换模型来源。仓库来源缺文件时前端进入下载页；模型就绪后自动重建索引。"""
+        kind = src.get("kind")
+        src = {"kind": kind, **{k: str(src.get(k) or "").strip() for k in ("repo", "model", "mmproj")}}
+        if kind == "official":
+            src = {"kind": "official"}
+        elif kind == "local":
+            src.pop("repo")
+        err = config.check_model_source(src)
+        if not err and kind == "local":
+            err = next((f"文件不存在：{src[k]}" for k in ("model", "mmproj") if not Path(src[k]).is_file()), "")
+        if err:
+            return {"error": err}
+        if src != self._settings.get("model_source"):
+            self._settings["model_source"] = src
+            config.save_settings(self._settings)
+            config.set_model_source(src)
+            self._restart_model()
+        return {"source": src, "missing": config.missing_models()}
+
+    def pick_model_file(self) -> str | None:
+        self._dialog_open = True
+        try:
+            r = self._window.create_file_dialog(webview.FileDialog.OPEN,
+                                                file_types=("GGUF 模型 (*.gguf)", "所有文件 (*.*)"))
+        finally:
+            self._dialog_open = False
+        return str(r[0]) if r else None
 
     def _restart_model(self):
         self._model_gen += 1  # 先让进行中的启动线程失效，它被中断时不会报“启动失败”

@@ -1,0 +1,152 @@
+/* 启动器面板：深色为主，浅色跟随系统或手动切换 */
+:root, :root[data-theme='dark'] {
+  --bg: #1e2024;
+  --raise: #26292e;
+  --raise-2: #2e3238;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-2: rgba(255, 255, 255, 0.13);
+  --text: #f2f3f5;
+  --text-2: #b4b8bf;
+  --text-3: #80858f;
+  --accent: #4cc2ff;
+  --accent-ink: #0b1a24;
+  --accent-text: #8fd8ff;
+  --sel: rgba(76, 194, 255, 0.15);
+  --hover: rgba(255, 255, 255, 0.045);
+  --c-text: #6cb6ff;
+  --c-image: #3ddc97;
+  --c-audio: #f5a524;
+  --c-video: #b18cff;
+  --ok: #3ddc97;
+  --warn: #f5a524;
+  --err: #ff6b6b;
+  --mark: rgba(245, 165, 36, 0.35);
+  --shadow: 0 16px 40px -12px rgba(0, 0, 0, 0.6);
+  --veil: 0 0 0;
+  color-scheme: dark;
+}
+:root[data-theme='light'] {
+  --bg: #fbfbfc;
+  --raise: #f1f2f4;
+  --raise-2: #e7e9ec;
+  --line: rgba(0, 0, 0, 0.07);
+  --line-2: rgba(0, 0, 0, 0.13);
+  --text: #17181a;
+  --text-2: #4d5157;
+  --text-3: #858a92;
+  --accent: #005fb8;
+  --accent-ink: #ffffff;
+  --accent-text: #005fb8;
+  --sel: rgba(0, 95, 184, 0.1);
+  --hover: rgba(0, 0, 0, 0.035);
+  --c-text: #2563eb;
+  --c-image: #059669;
+  --c-audio: #d97706;
+  --c-video: #7c3aed;
+  --ok: #059669;
+  --warn: #b45309;
+  --err: #dc2626;
+  --mark: rgba(250, 204, 21, 0.45);
+  --shadow: 0 16px 40px -14px rgba(0, 0, 0, 0.25);
+  --veil: 255 255 255;
+  color-scheme: light;
+}
+/* 半透明磨砂：底色和卡片改成半透明，系统亚克力负责模糊窗口背后的内容（见 shell.set_acrylic） */
+:root[data-glass='on'][data-theme='dark'] {
+  --bg: rgba(16, 18, 22, 0.38);
+  --raise: rgba(34, 37, 43, 0.56);
+  --raise-2: rgba(58, 62, 70, 0.64);
+  --line: rgba(255, 255, 255, 0.10);
+  --line-2: rgba(255, 255, 255, 0.18);
+  --hover: rgba(255, 255, 255, 0.08);
+  --sel: rgba(76, 194, 255, 0.22);
+  --text-2: #c3c7ce;
+  --text-3: #9aa0a9;
+}
+:root[data-glass='on'][data-theme='light'] {
+  --bg: rgba(250, 251, 253, 0.46);
+  --raise: rgba(255, 255, 255, 0.56);
+  --raise-2: rgba(238, 240, 244, 0.72);
+  --line: rgba(0, 0, 0, 0.09);
+  --line-2: rgba(0, 0, 0, 0.15);
+  --hover: rgba(0, 0, 0, 0.05);
+  --sel: rgba(0, 95, 184, 0.14);
+  --text-2: #3f4348;
+  --text-3: #6d727a;
+}
+:root {
+  --font: 'Segoe UI Variable Text', 'Segoe UI', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
+  --font-display: 'Segoe UI Variable Display', 'Segoe UI', 'Microsoft YaHei UI', sans-serif;
+  --mono: 'Cascadia Mono', Consolas, 'Microsoft YaHei UI', monospace;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13.5px/1.45 var(--font);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+input, select { font: inherit; color: inherit; }
+::selection { background: var(--sel); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 背景层：自定义背景图（模糊）+ 遮罩。半透明磨砂时这里是透出桌面的“玻璃”，
+   关了磨砂又没有背景图时整个面板就是纯色（body 的 --bg），与原来一致。
+   两张层都在内容之下（负 z-index），所以面板内的半透明色块直接叠在它们上面。 */
+body::before,
+body::after { content: ''; position: fixed; inset: 0; z-index: -1; pointer-events: none; display: none; }
+body::before { z-index: -2; background: var(--bg-image, none) center / cover no-repeat;
+  filter: blur(var(--bg-blur, 18px)); transform: scale(1.08); }
+body::after { background: rgb(var(--veil) / var(--bg-dim, 0.42)); }
+:root[data-backdrop='on'] body::before {
+  inset: calc(-1 * var(--backdrop-pad, 48px));
+  background-position: var(--backdrop-x, 48px) var(--backdrop-y, 48px);
+  background-size: var(--backdrop-width) var(--backdrop-height);
+  transform: none;
+  filter: none; /* 截图在后端已缩小并模糊好；拖动时逐帧 CSS blur 大图会掉帧 */
+}
+:root[data-glass='on'] body { background: transparent; }  /* 让系统模糊的桌面透出来 */
+:root[data-glass='on'] body::before,
+:root[data-glass='on'] body::after,
+:root[data-image='on'] body::before,
+:root[data-image='on'] body::after { display: block; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 6px; border: 3px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
+
+.btn {
+  display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 13px;
+  border-radius: 7px; border: 1px solid var(--line-2); background: transparent;
+  font-size: 13px; white-space: nowrap; transition: background 0.12s, border-color 0.12s;
+}
+.btn:hover { background: var(--hover); }
+.btn:disabled { opacity: 0.45; pointer-events: none; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: transparent; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.08); }
+.btn.danger { color: var(--err); }
+.icon-btn {
+  display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 6px;
+  border: none; background: transparent; color: var(--text-3); transition: background 0.12s, color 0.12s;
+}
+.icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn.on { color: var(--accent-text); background: var(--sel); }
+kbd {
+  display: inline-block; min-width: 18px; padding: 0 5px; border-radius: 4px;
+  background: var(--raise-2); font: 500 11px/18px var(--font); color: var(--text-2); text-align: center;
+}
+.spinner {
+  width: 13px; height: 13px; border-radius: 50%; flex: none;
+  border: 2px solid var(--line-2); border-top-color: var(--accent);
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } }

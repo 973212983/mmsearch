@@ -1,9 +1,11 @@
 import { reactive, computed } from 'vue'
 import { call, on } from './api'
+import { queryTerms } from './format'
 
 export const KINDS = {
   text: { label: '文档', icon: 'file', color: 'var(--c-text)' },
   image: { label: '图片', icon: 'image', color: 'var(--c-image)' },
+  page: { label: '扫描页', icon: 'file', color: 'var(--c-text)' },
   audio: { label: '音频', icon: 'music', color: 'var(--c-audio)' },
   video: { label: '视频', icon: 'video', color: 'var(--c-video)' },
   video_audio: { label: '视频 · 声音', icon: 'video', color: 'var(--c-video)' },
@@ -98,6 +100,11 @@ export const rows = computed(() => {
       return out
     }
   }
+  // 只有过滤条件时按修改时间列出，没有分数，不折叠
+  if (list[0].score == null) {
+    list.forEach((h) => out.push({ type: 'hit', hit: h }))
+    return out
+  }
   // 同一类型内相似度可比：与最高分差距过大的折叠起来
   const cut = list[0].score - STRONG_MARGIN
   const strong = list.filter((h, i) => h.score >= cut || i < 3)
@@ -114,7 +121,9 @@ export const rows = computed(() => {
 export const selectable = computed(() => rows.value.map((r, i) => (r.type === 'header' ? -1 : i)).filter((i) => i >= 0))
 export const current = computed(() => rows.value[selectable.value[S.cursor]] || null)
 export const currentHit = computed(() => (current.value?.type === 'hit' ? current.value.hit : null))
-export const isMedia = (h) => !!h && h.kind !== 'text' && h.kind !== 'image'
+/** 用来高亮和挑选片段的查询词（去掉了 ext: 这类过滤条件） */
+export const highlightTerms = computed(() => (S.query?.type === 'text' ? queryTerms(S.info?.text ?? S.query.text) : []))
+export const isMedia = (h) => !!h && h.kind !== 'text' && h.kind !== 'image' && h.kind !== 'page'
 
 export function move(d) {
   const n = selectable.value.length
@@ -166,7 +175,7 @@ async function run(query, fn, ...args) {
   if (!r || r.error) return toast(r?.error || '搜索失败', 'error')
   if (r.query?.thumb) S.query = { ...query, thumb: r.query.thumb }
   S.results = r.results
-  S.info = { enc: r.enc_ms, search: r.search_ms, total: r.total }
+  S.info = { enc: r.enc_ms, search: r.search_ms, total: r.total, filters: r.filters || [], text: r.text }
   S.expanded = false
   S.cursor = 0
   if (S.tab !== 'all' && !(r.results[S.tab] || []).length) S.tab = 'all'
@@ -184,6 +193,14 @@ export const searchImageData = (dataUrl, label) =>
 export function searchSimilar(hit) {
   commit()
   return run({ type: 'similar', label: `与「${hit.name}」相似`, thumb: hit.thumb, kind: hit.kind }, 'search_similar', hit.id)
+}
+
+/** 以图（文件、粘贴、找相似）搜索时再输入文字：在原图的基础上补充描述（组合查询），图片查询保留在搜索框左侧 */
+export function searchRefine(text) {
+  if (!S.query || S.query.type === 'text') return searchText(text)
+  text = text.trim()
+  if ((S.query.refine || '') === text && S.results) return
+  return run({ ...S.query, refine: text }, 'search_refine', text)
 }
 
 export async function pickFile() {

@@ -76,6 +76,9 @@ const parent = (p) => parts(p).slice(0, -1).join('\\')
         </button>
       </div>
       <button class="add" @click="call('pick_folder')"><Icon name="plus" :size="16" /> 添加文件夹</button>
+      <button v-if="S.overview.stats?.image" class="tool" @click="S.view = 'dupes'">
+        <Icon name="image" :size="15" /> 整理相似和重复的图片<Icon name="chevron" :size="14" class="go" />
+      </button>
       <div v-if="known.length" class="quick">
         <span>常用位置</span>
         <button v-for="k in known" :key="k.key" class="qk" :title="k.path" @click="call('add_folders', [k.path])"><Icon name="plus" :size="13" /> {{ k.label }}</button>
@@ -124,6 +127,9 @@ h2 { margin: 0; font: 600 18px var(--font-display); }
 .rm.confirm { background: var(--err); color: #fff; }
 .add { display: flex; align-items: center; justify-content: center; gap: 7px; height: 46px; border-radius: 9px; border: 1.5px dashed var(--line-2); background: transparent; color: var(--text-2); }
 .add:hover { border-color: var(--accent); color: var(--accent-text); }
+.tool { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 12px; border: none; border-radius: 9px; background: var(--raise); color: var(--text-2); font-size: 13px; }
+.tool:hover { color: var(--accent-text); }
+.tool .go { margin-left: auto; transform: rotate(-90deg); }
 .quick { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--text-3); }
 .quick > span { margin-right: 4px; }
 .qk { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 10px 0 8px; border-radius: 13px; border: 1px solid var(--line-2); background: transparent; color: var(--text-2); font-size: 12px; }

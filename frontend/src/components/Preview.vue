@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import Waveform from './Waveform.vue'
-import { S, KINDS, currentHit, openHit, searchSimilar, copyFile, copyPath, openMenu } from '../store'
+import { S, KINDS, currentHit, highlightTerms, openHit, searchSimilar, copyFile, copyPath, openMenu } from '../store'
 import { call } from '../api'
 import { fmtSize as size, fmtTime as fmt } from '../format'
 
@@ -13,7 +13,7 @@ const playing = ref(false)
 const cur = ref(0)
 let infoTimer = 0
 
-const seg = computed(() => (h.value?.start != null && h.value.kind !== 'text' ? `${fmt(h.value.start)} – ${fmt(h.value.end)}` : ''))
+const seg = computed(() => (h.value?.start != null && h.value.kind !== 'text' && h.value.kind !== 'page' ? `${fmt(h.value.start)} – ${fmt(h.value.end)}` : ''))
 const segLen = computed(() => Math.max(0.1, (h.value?.end ?? 0) - (h.value?.start ?? 0)))
 const progress = computed(() => (playing.value || cur.value > (h.value?.start ?? 0) + 0.05
   ? Math.min(1, Math.max(0, (cur.value - (h.value?.start ?? 0)) / segLen.value)) : -1))
@@ -35,28 +35,10 @@ watch(h, (v) => {
 }, { immediate: true })
 
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
-const STOP = new Set('的了和与及或是在把被就都也而这那个些有为之其于从对')
-/** 查询里的高亮词。中文没有空格，取每段连续汉字中所有 ≥2 字的子串（“会议纪要”能命中“会议”“纪要”），
- *  去掉以虚词开头或结尾的（“边的”“的日”）；英文和数字按词。 */
-function queryTerms(q) {
-  const out = new Set()
-  for (const tok of q.split(/[\s,，.。、;；:：!！?？"“”'‘’()（）]+/)) {
-    for (const run of tok.match(/\p{Script=Han}+/gu) || []) {
-      const r = run.slice(0, 12)
-      if (r.length === 1 && run === tok && !STOP.has(r)) out.add(r)
-      for (let n = r.length; n >= 2; n--)
-        for (let i = 0; i + n <= r.length; i++) {
-          const g = r.slice(i, i + n)
-          if (!STOP.has(g[0]) && !STOP.has(g[n - 1])) out.add(g)
-        }
-    }
-    for (const w of tok.match(/[A-Za-z0-9_][\w.\-]+/g) || []) out.add(w)
-  }
-  return [...out].sort((a, b) => b.length - a.length)
-}
+const paper = ref(null)
 const snippetHtml = computed(() => {
   const text = h.value?.snippet || ''
-  const terms = S.query?.type === 'text' ? queryTerms(S.query.text) : []
+  const terms = highlightTerms.value
   if (!terms.length) return esc(text)
   const re = new RegExp(terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi')
   let html = '', last = 0
@@ -66,6 +48,13 @@ const snippetHtml = computed(() => {
   }
   return html + esc(text.slice(last))
 })
+// 片段较长时滚到第一个高亮处（放在上方三分之一），不用自己往下翻
+watch(snippetHtml, async () => {
+  await nextTick()
+  const p = paper.value, m = p?.querySelector('mark')
+  if (!p) return
+  p.scrollTop = m ? Math.max(0, m.getBoundingClientRect().top - p.getBoundingClientRect().top + p.scrollTop - p.clientHeight / 3) : 0
+}, { immediate: true })
 
 function togglePlay() {
   const m = media.value
@@ -96,7 +85,7 @@ defineExpose({ togglePlay })
   <section class="pv" aria-label="预览" @contextmenu="h && onMenu($event)">
     <template v-if="h">
       <div class="stage" :class="h.kind">
-        <img v-if="h.kind === 'image'" :key="h.full" :src="h.full" alt="" class="full" />
+        <img v-if="h.kind === 'image' || h.kind === 'page'" :key="h.full" :src="h.full" alt="" class="full" />
         <template v-else-if="h.kind === 'video' || h.kind === 'video_audio'">
           <video v-if="h.playable" ref="media" :key="h.media" :src="h.media" :poster="h.poster" controls preload="metadata"
                  @play="playing = true" @pause="playing = false" @timeupdate="cur = $event.target.currentTime" />
@@ -113,7 +102,7 @@ defineExpose({ togglePlay })
           <audio v-if="h.playable" ref="media" :key="h.media" :src="h.media" preload="metadata"
                  @play="playing = true" @pause="playing = false" @timeupdate="cur = $event.target.currentTime" />
         </div>
-        <div v-else class="paper" :class="{ code: h.code }" v-html="snippetHtml" />
+        <div v-else ref="paper" class="paper" :class="{ code: h.code }" v-html="snippetHtml" />
       </div>
 
       <div class="title">
@@ -124,7 +113,8 @@ defineExpose({ togglePlay })
       <div class="meta">
         <span class="chip"><i :style="{ background: KINDS[h.kind]?.color }" />{{ KINDS[h.kind]?.label }} · {{ (h.ext || '—').toUpperCase() }}</span>
         <span v-if="seg" class="chip">片段 {{ seg }}</span>
-        <span class="chip" title="与查询的余弦相似度（关键词命中的结果另有加分）。不同类型文件的分数尺度不同（图片、音频普遍低于文档），只适合在同类结果之间比较">相似度 {{ h.score.toFixed(3) }}</span>
+        <span v-if="h.kind === 'page'" class="chip">第 {{ h.start }} 页</span>
+        <span v-if="h.score != null" class="chip" title="与查询的余弦相似度（关键词命中的结果另有加分）。不同类型文件的分数尺度不同（图片、音频普遍低于文档），只适合在同类结果之间比较">相似度 {{ h.score.toFixed(3) }}</span>
         <span v-if="h.lexical" class="chip" title="文件名或正文里出现了查询中的关键词">关键词命中</span>
         <template v-if="info?.exists"><span class="chip">{{ size(info.size) }}</span><span class="chip">{{ new Date(info.mtime * 1000).toLocaleDateString('zh-CN') }}</span></template>
         <span v-else-if="info" class="chip warn">文件已移动或删除</span>

@@ -198,6 +198,44 @@ class LexicalSearchTests(StoreTestCase):
         self.store.db.execute("INSERT INTO paths_fts(paths_fts) VALUES('integrity-check')")
 
 
+class SimilarGroupTests(StoreTestCase):
+    def put_image(self, path: str, v: np.ndarray):
+        v = (v / np.linalg.norm(v)).astype(np.float32)[None]
+        self.store.put_file(path, 1.0, 1, "image", [{"kind": "image", "snippet": path}], v)
+
+    def test_groups_near_identical_images_and_skips_singletons(self):
+        rng = np.random.default_rng(0)
+        a, b = rng.standard_normal(768), rng.standard_normal(768)
+        self.put_image(r"C:\p\a1.jpg", a)
+        self.put_image(r"C:\p\a2.jpg", a + 0.05 * rng.standard_normal(768))  # 重新压缩过的副本
+        self.put_image(r"C:\p\a3.jpg", a + 0.05 * rng.standard_normal(768))
+        self.put_image(r"C:\p\b.jpg", b)
+        self.put("doc.txt", 7)  # 文档不参与
+
+        groups = self.store.similar_groups(0.95)
+
+        self.assertEqual([{r"C:\p\a1.jpg", r"C:\p\a2.jpg", r"C:\p\a3.jpg"}], [{h.path for h in g} for g in groups])
+        self.assertAlmostEqual(1.0, groups[0][0].score, places=3)
+        self.assertEqual([], self.store.similar_groups(0.9999))
+
+    def test_duplicates_are_grouped_by_dhash_distance(self):
+        v = np.ones(768)
+        for name, h in [("a1", 0x0F0F0F0F0F0F0F0F), ("a2", 0x0F0F0F0F0F0F0F0E),  # 差 1 位：重新压缩过的副本
+                        ("a3", 0x0F0F0F0F0F0F0FFF), ("b", 0x7070707070707070),  # a3 差 4 位；b 完全不同
+                        ("blank1", 0), ("blank2", 0)]:  # 纯色图不参与
+            self.put_image(rf"C:\p\{name}.jpg", v)
+            self.store.set_dhash([(self.store.db.execute("SELECT id FROM files WHERE path=?",
+                                                          (rf"C:\p\{name}.jpg",)).fetchone()[0], h)])
+        self.put_image(r"C:\p\new.jpg", v)  # 还没算 dHash
+
+        groups = self.store.duplicate_groups(max_dist=8)
+
+        self.assertEqual([[r"C:\p\a1.jpg", r"C:\p\a2.jpg", r"C:\p\a3.jpg"]], [[h.path for h in g] for g in groups])
+        self.assertAlmostEqual(1 - 1 / 64, groups[0][1].score)
+        self.assertEqual([], self.store.duplicate_groups(max_dist=0))
+        self.assertEqual([r"C:\p\new.jpg"], [p for _, p in self.store.missing_dhash()])
+
+
 class VectorStoreMigrationTests(unittest.TestCase):
     def test_opening_a_database_without_keyword_index_builds_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +270,7 @@ class VectorStoreMigrationTests(unittest.TestCase):
 
             self.assertEqual({"old.txt": None, "new.txt": "h1"},
                              dict(store.db.execute("SELECT path, hash FROM files")))
+            self.assertEqual([None, None], [r[0] for r in store.db.execute("SELECT dhash FROM files")])
             store.db.close()
 
 

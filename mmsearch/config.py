@@ -45,6 +45,7 @@ DEFAULT_SETTINGS = {
     "image_tokens": int(os.environ.get("MMSEARCH_IMAGE_TOKENS", 280)),
     "auto_index": True,
     "watch": True,  # 监听已添加的文件夹，文件新增/修改/删除后自动更新索引
+    "pause_busy": True,  # 用电池或全屏应用（游戏、视频、演示）在前台时暂停后台索引
     "view": "grid",
     "hf_endpoint": HF_ENDPOINTS[0][0],
     "model_source": {"kind": "official"},
@@ -158,14 +159,23 @@ RERANK_CANDIDATES = 200
 # 混合检索：文字查询的关键词命中（文件名、正文）给向量相似度加分，最多加这么多（见 store.lexical）
 LEXICAL_BOOST = 0.1
 LEXICAL_CANDIDATES = 50  # 正文关键词命中取 bm25 最好的前 N 条
+# 以图搜索后补充文字（组合查询）：文字向量的权重，其余是图片向量
+COMPOSE_TEXT_WEIGHT = 0.5
+# 整理图片：「几乎相同」（副本、缩放、重新压缩）按 dHash 汉明距离分组。实测缩小到 1/4 再 JPEG q50 压缩最多差 6 位，
+# 随机两张不同的图 2000 对里只有 1 对 ≤8（还是两张空白图，现在纯色图不参与比较）
+DHASH_SAME_MAX = 8
+# 「相似」（连拍、同一场景）按图片向量两两余弦分组。待图片索引完后用库里的向量校准
+IMAGE_SIMILAR_THRESHOLD = 0.9
 
 # 文本切块
 TEXT_CHUNK_CHARS = 1200
 TEXT_CHUNK_OVERLAP = 150
 TEXT_MAX_CHUNKS_PER_FILE = 200
 # 日志、数据导出这类机器生成的文件往往很大、内容重复：只取开头、中间、结尾各几块
-DATA_EXT = {".log", ".json", ".csv", ".xml", ".sql", ".yaml", ".yml"}
+DATA_EXT = {".log", ".json", ".csv", ".xml", ".sql", ".yaml", ".yml", ".xlsx"}
 DATA_CHUNKS_EACH = 10
+# 扫描版 PDF（页面没有文字层、是整页图片）：每页按图片编码（约 3.5 s/页），每个文件最多编码这么多页
+SCANNED_PDF_MAX_PAGES = 10
 
 # 音频：每段 30s（25 token/s → 750 token）
 AUDIO_SEGMENT_SEC = 30.0
@@ -174,6 +184,9 @@ AUDIO_SR = 16000
 VIDEO_SEGMENT_SEC = 30.0
 VIDEO_FRAMES_PER_SEGMENT = 4  # 每帧约 1.5s（Iris Xe），4 帧 ≈ 6s 处理 30s 视频
 VIDEO_MAX_SEGMENTS = 240  # 最多处理 2 小时
+# 画面和最近编码过的一段几乎一样（media.frames_diff 小于这个值）就复用它的向量，不再编码。
+# 实测录屏相邻段差 0.01%~0.02%，向量余弦约 0.998（同一段编码两次也只有 1.0）
+VIDEO_STATIC_DIFF = 0.001
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".wma", ".opus"}
@@ -184,7 +197,7 @@ TEXT_EXT = {
     ".c", ".h", ".cpp", ".hpp", ".cs", ".rs", ".rb", ".php", ".sh", ".ps1", ".sql", ".kt",
     ".swift", ".lua", ".vue", ".css", ".scss",
 }
-DOC_EXT = {".pdf", ".docx"}
+DOC_EXT = {".pdf", ".docx", ".pptx", ".xlsx", ".epub"}
 CODE_EXT = TEXT_EXT - {".txt", ".md", ".markdown", ".rst", ".log", ".csv", ".html", ".htm"}
 
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "$RECYCLE.BIN",

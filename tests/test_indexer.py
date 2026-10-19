@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +106,34 @@ class IndexerTests(unittest.TestCase):
         self.assertEqual([("image", 2)], self.run_index())
         self.assertEqual({"red.png", "red copy.png", "blue.png"}, self.indexed())
         self.assertEqual(3, len(self.store))
+
+    def test_static_video_segments_reuse_the_last_encoded_vector(self):
+        rng = np.random.default_rng(0)
+        a = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
+        b = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
+        seg = lambda arr: [Image.fromarray(arr)] * 2
+        cursor = a.copy()
+        cursor[10:12, 10:12] = 255  # 录屏里光标动了一下：几乎没变
+        units = [("video", 0, 30, seg(a)), ("video", 30, 60, seg(cursor)), ("video", 60, 90, seg(b)),
+                 ("video", 90, 120, seg(a)), ("video_audio", 0, 30, np.ones(16000, np.float32))]
+
+        class VideoEmbedder(FakeEmbedder):
+            def encode_videos(self, segs):
+                self.calls.append(("video", len(segs)))
+                return np.stack([unit(segs[0][0].tobytes())])
+
+            def encode_audios(self, clips):
+                self.calls.append(("audio", len(clips)))
+                return np.stack([unit(c.tobytes()) for c in clips])
+
+        emb = VideoEmbedder()
+        with unittest.mock.patch.object(Indexer, "_video_units", staticmethod(lambda p: (u for u in units))):
+            items, vecs = Indexer(self.store, emb)._process(Path("clip.mp4"), "video")
+
+        self.assertEqual([("video", 1), ("video", 1), ("video", 1), ("audio", 1)], emb.calls)  # 第 2 段复用了第 1 段
+        self.assertEqual([0, 30, 60, 90, 0], [it["start"] for it in items])
+        self.assertTrue(np.array_equal(vecs[0], vecs[1]))
+        self.assertFalse(np.array_equal(vecs[1], vecs[2]))
 
     def test_scan_skips_hidden_and_tool_directories(self):
         self.write("keep.txt", "x")

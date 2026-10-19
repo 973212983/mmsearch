@@ -28,6 +28,7 @@ from . import config
 
 # 每个请求的最大条数：llama-server 逐条编码，批量主要省 HTTP 往返
 REQ_BATCH = {"text": 32, "image": 8, "audio": 4, "video": 1}
+PAUSE_POLL = 2.0  # 后台索引暂停时，每隔这么久看一次能否继续
 
 
 class EmbedError(RuntimeError):
@@ -248,6 +249,8 @@ class Embedder:
         self.should_stop = lambda: False  # 索引用：每个请求前检查，便于快速停止
         self.batch = REQ_BATCH  # 每个请求的条数；索引器会改小，见 indexer.py
         self.background = False  # 索引器设为 True：同一时间只发一个请求，并给搜索让路
+        self.pause_reason = lambda: None  # 后台请求前检查：返回原因（用电池、全屏应用）时暂停，直到没有原因
+        self.on_pause = lambda reason: None  # 进入暂停（原因）/ 恢复（None）时通知界面
         self._bg_lock = threading.Lock()
         self._qcache: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
@@ -260,7 +263,22 @@ class Embedder:
     def _background_slot(self):
         with self._bg_lock:
             _GATE.wait_idle()
+            self._wait_unpaused()
             yield
+
+    def _wait_unpaused(self):
+        reason = self.pause_reason()
+        if not reason:
+            return
+        self.on_pause(reason)
+        try:
+            while reason:
+                if self.should_stop():
+                    raise Cancelled()
+                time.sleep(PAUSE_POLL)
+                reason = self.pause_reason()
+        finally:
+            self.on_pause(None)
 
     def _embed(self, inputs: list, kind: str) -> np.ndarray:
         self.server.ensure_started()

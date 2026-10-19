@@ -272,6 +272,28 @@ class Tray:
             pass
 
 
+# ---------------------------------------------------------------- 后台索引让路
+class _PowerStatus(ctypes.Structure):
+    _fields_ = [("ACLineStatus", wt.BYTE), ("BatteryFlag", wt.BYTE), ("BatteryLifePercent", wt.BYTE),
+                ("SystemStatusFlag", wt.BYTE), ("BatteryLifeTime", wt.DWORD), ("BatteryFullLifeTime", wt.DWORD)]
+
+
+# SHQueryUserNotificationState：2 全屏应用（如视频、游戏）、3 Direct3D 全屏游戏、4 演示模式（放映 PPT）
+_BUSY_STATES = {2: "全屏应用运行中", 3: "全屏游戏运行中", 4: "演示模式"}
+
+
+def busy_reason() -> str | None:
+    """后台索引该暂停的原因（用电池、全屏应用在前台）；没有则返回 None。
+    索引会让核显满载：用电池时很费电，全屏游戏、视频、演示时会抢显卡导致卡顿。"""
+    ps = _PowerStatus()
+    if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(ps)) and ps.ACLineStatus == 0:
+        return "使用电池"
+    state = ctypes.c_int()
+    if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) == 0:
+        return _BUSY_STATES.get(state.value)
+    return None
+
+
 # ---------------------------------------------------------------- 常用文件夹
 KNOWN_FOLDERS = [  # (key, 显示名, FOLDERID)；用系统 API 取路径，OneDrive 重定向后也正确
     ("documents", "文档", "{FDD39AD0-238F-46AF-ADB4-6C85480369C7}"),

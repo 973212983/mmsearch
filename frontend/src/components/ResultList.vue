@@ -1,18 +1,18 @@
 <script setup>
 import { nextTick, ref, watch } from 'vue'
 import Icon from './Icon.vue'
-import { S, KINDS, rows, selectable, setTab, selectRow, activate, clearRecent, openMenu } from '../store'
-import { fmtDate, fmtTime } from '../format'
+import { S, KINDS, rows, selectable, highlightTerms, setTab, selectRow, activate, clearRecent, openMenu } from '../store'
+import { bestLine, fmtDate, fmtTime } from '../format'
 
 const box = ref(null)
 const sub = (h) => {
   if (h.kind === 'text') {
-    // 文档显示片段开头，比文件夹名更有信息量
-    const line = (h.snippet || '').split('\n').map((l) => l.replace(/^[#>*\-\s]+/, '').trim()).find((l) => l) || ''
-    return `${(h.ext || 'txt').toUpperCase()} · ${line}`
+    // 文档显示片段里和查询最相关的一行（没有关键词命中时是开头），比文件夹名更有信息量
+    return `${(h.ext || 'txt').toUpperCase()} · ${bestLine(h.snippet, highlightTerms.value)}`
   }
   const parts = [KINDS[h.kind]?.label]
-  if (h.start != null && h.kind !== 'text') parts.push(`${fmtTime(h.start)}–${fmtTime(h.end)}`)
+  if (h.kind === 'page') parts.push(`${(h.ext || '').toUpperCase()} 第 ${h.start} 页`)
+  else if (h.start != null && h.kind !== 'text') parts.push(`${fmtTime(h.start)}–${fmtTime(h.end)}`)
   parts.push(h.folder || h.dir)
   return parts.join(' · ')
 }

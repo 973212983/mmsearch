@@ -7,6 +7,7 @@ import Preview from './components/Preview.vue'
 import Footer from './components/Footer.vue'
 import IndexView from './components/IndexView.vue'
 import SettingsView from './components/SettingsView.vue'
+import DupesView from './components/DupesView.vue'
 import Onboarding from './components/Onboarding.vue'
 import Welcome from './components/Welcome.vue'
 import ContextMenu from './components/ContextMenu.vue'
@@ -125,6 +126,7 @@ onMounted(async () => {
           </template>
         </template>
         <IndexView v-else-if="S.view === 'index'" class="full" />
+        <DupesView v-else-if="S.view === 'dupes'" class="full" />
         <SettingsView v-else class="full" />
       </main>
 

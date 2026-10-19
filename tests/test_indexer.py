@@ -2,14 +2,16 @@ import hashlib
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
 
-from mmsearch import config, media
-from mmsearch.indexer import Indexer, scan
+from mmsearch import config, media, watcher
+from mmsearch.indexer import Indexer, _within_folders, scan
 from mmsearch.store import VectorStore
 
 
@@ -114,6 +116,94 @@ class IndexerTests(unittest.TestCase):
         found = {os.path.relpath(p, self.root): (mod, st.st_size) for p, mod, st in scan([str(self.root)])}
 
         self.assertEqual({"keep.txt": ("text", 1), os.path.join("sub", "deep", "photo.jpg"): ("image", 17)}, found)
+
+    def run_scoped(self, *scope) -> list:
+        self.emb.calls = []
+        Indexer(self.store, self.emb).run(scope={(str(self.root / d) if d else str(self.root), rec) for d, rec in scope})
+        return self.emb.calls
+
+    def test_scoped_run_only_touches_the_given_directories(self):
+        self.write("a/x.txt", "一")
+        self.write("b/y.txt", "二")
+        self.run_index()
+        self.write("a/new.txt", "三")
+        self.write("b/new.txt", "四")
+        os.remove(self.root / "b" / "y.txt")
+
+        self.assertEqual([("text", 1)], self.run_scoped(("a", False)))
+        # b 没在范围里：新文件还没处理，删掉的文件也还在
+        self.assertEqual({os.path.join("a", "x.txt"), os.path.join("a", "new.txt"), os.path.join("b", "y.txt")},
+                         self.indexed())
+
+    def test_scoped_run_of_a_removed_directory_drops_its_files(self):
+        self.write("old/deep/x.txt", "一")
+        self.write("keep.txt", "二")
+        self.run_index()
+        shutil.rmtree(self.root / "old")
+
+        self.assertEqual([], self.run_scoped(("old", True)))
+        self.assertEqual({"keep.txt"}, self.indexed())
+
+    def test_scoped_run_reuses_vectors_of_a_moved_directory(self):
+        self.write("old/x.txt", "一")
+        self.run_index()
+        os.rename(self.root / "old", self.root / "new")
+
+        self.assertEqual([], self.run_scoped(("old", True), ("new", True)))
+        self.assertEqual({os.path.join("new", "x.txt")}, self.indexed())
+
+    def test_scope_outside_added_folders_is_ignored(self):
+        outside = Path(self.tempdir.name) / "outside"
+        outside.mkdir()
+        (outside / "z.txt").write_text("外面", encoding="utf-8")
+
+        Indexer(self.store, self.emb).run(scope={(str(outside), True)})
+        self.assertEqual(set(), self.indexed())
+
+
+class WatcherScopeTests(unittest.TestCase):
+    def test_events_map_to_directories_to_rescan(self):
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "newdir"))
+        j = lambda *p: os.path.join(root, *p)
+        self.assertEqual([(j("sub"), False)], watcher.scopes_for(root, watcher.MODIFIED, os.path.join("sub", "a.txt")))
+        self.assertEqual([(j("newdir"), True)], watcher.scopes_for(root, watcher.ADDED, "newdir"))
+        self.assertEqual([(j("gone"), True)], watcher.scopes_for(root, watcher.REMOVED, "gone"))
+        self.assertEqual([], watcher.scopes_for(root, watcher.MODIFIED, "newdir"))  # 目录自身的修改由子项记录处理
+        self.assertEqual([], watcher.scopes_for(root, watcher.ADDED, os.path.join(".git", "index.txt")))
+        self.assertEqual([], watcher.scopes_for(root, watcher.ADDED, os.path.join("node_modules", "x", "a.js")))
+        self.assertEqual([], watcher.scopes_for(root, watcher.ADDED, "~$报告.docx"))
+        self.assertEqual([], watcher.scopes_for(root, watcher.ADDED, "setup.exe"))
+        shutil.rmtree(root)
+
+    def test_nested_scopes_are_merged(self):
+        root = r"C:\data"
+        scope = {(r"C:\data\a", True), (r"C:\data\a\b", False), (r"C:\data\a\c", True), (r"C:\data\x", False),
+                 (r"C:\other", True)}
+        self.assertEqual({(r"C:\data\a", True), (r"C:\data\x", False)}, _within_folders(scope, [root]))
+
+
+class FolderWatcherTests(unittest.TestCase):
+    def test_changes_are_reported_once_after_a_quiet_period(self):
+        root = tempfile.mkdtemp()
+        got, done = [], threading.Event()
+        w = watcher.FolderWatcher(lambda scope: (got.append(scope), done.set()))
+        old_quiet, watcher.QUIET = watcher.QUIET, 0.3
+        try:
+            w.set_folders([root])
+            time.sleep(0.2)
+            os.makedirs(os.path.join(root, "sub"))
+            for i in range(5):
+                Path(root, "sub", f"n{i}.txt").write_text(str(i), encoding="utf-8")
+            Path(root, "skip.bin").write_bytes(b"x")
+            self.assertTrue(done.wait(5))
+            time.sleep(0.5)
+        finally:
+            watcher.QUIET = old_quiet
+            w.stop()
+            shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(1, len(got))
+        self.assertIn((os.path.join(root, "sub"), False), got[0])
 
 
 class DataFileChunkTests(unittest.TestCase):

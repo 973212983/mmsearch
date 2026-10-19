@@ -29,7 +29,7 @@ FULL_HASH_BYTES = 64 << 20  # 文本、图片本来就要整个读进来，指�
 HASH_WINDOW = 1 << 20  # 音视频（和超大图片）只读开头、中间、结尾各 1 MB，再加上文件大小
 
 
-def scan(folders: list[str]):
+def scan(folders: list[str], recursive: bool = True):
     """产出 (路径, 模态, stat)。Windows 上 DirEntry.stat() 直接来自目录枚举，
     不必再逐个文件打开查询：几千个文件的增量扫描快 5~25 倍。"""
     stack = list(folders)
@@ -42,14 +42,33 @@ def scan(folders: list[str]):
             for e in it:
                 try:
                     if e.is_dir():
-                        if e.name not in config.SKIP_DIRS and not e.name.startswith(".") and not e.is_symlink():
+                        if recursive and e.name not in config.SKIP_DIRS and not e.name.startswith(".") \
+                                and not e.is_symlink():
                             stack.append(e.path)
                         continue
                     mod = config.modality_of(Path(e.name))
-                    if mod:
+                    if mod and not e.name.startswith("~$"):  # Office 编辑时的锁文件
                         yield Path(e.path), mod, e.stat()
                 except OSError:
                     continue
+
+
+def _within_folders(scope, folders: list[str]) -> set[tuple[str, bool]]:
+    """只保留在已添加文件夹里面的目录（监听回调和移除文件夹可能交错），并去掉被递归扫描覆盖的重复项。"""
+    norm = lambda d: os.path.normcase(d.rstrip("\\/"))
+    under = lambda d, r: d == r or d.startswith(r + os.sep)
+    roots = [norm(f) for f in folders]
+    scope = {(d, rec) for d, rec in scope if any(under(norm(d), r) for r in roots)}
+    deep = {norm(d) for d, rec in scope if rec}
+    covered = lambda d, rec: any(under(norm(d), r) and (norm(d), rec) != (r, True) for r in deep)
+    return {(d, rec) for d, rec in scope if not covered(d, rec)}
+
+
+def _scope_test(scope: set[tuple[str, bool]]) -> Callable[[str], bool]:
+    """路径是否落在 scope 里：递归的看前缀，不递归的只看直接所在目录。"""
+    flat = {os.path.normcase(d) for d, rec in scope if not rec}
+    deep = tuple(os.path.normcase(d.rstrip("\\/")) + os.sep for d, rec in scope if rec)
+    return lambda p: os.path.normcase(os.path.dirname(p)) in flat or os.path.normcase(p).startswith(deep)
 
 
 def fingerprint(path: Path, mod: str, size: int) -> str:
@@ -87,12 +106,21 @@ class Indexer:
         embedder.batch = INDEX_REQ_BATCH
         embedder.background = True
 
-    def run(self, progress: Callable[[int, int, str], None] = lambda *a: None):
-        """progress(done, total, message)。模型服务出错时抛出 EmbedError。"""
+    def run(self, progress: Callable[[int, int, str], None] = lambda *a: None,
+            scope: set[tuple[str, bool]] | None = None):
+        """progress(done, total, message)。模型服务出错时抛出 EmbedError。
+        scope：只重新扫描这些 (目录, 是否递归)（文件夹监听发现的变化）；None 扫描全部已添加的文件夹。"""
         self.cancelled = False
         known = self.store.file_states()
+        if scope is None:
+            entries = scan(self.store.folders())
+        else:  # 只对比 scope 里的已索引文件：其他地方的文件没被扫描，不能当作已删除
+            scope = _within_folders(scope, self.store.folders())
+            entries = (e for d, rec in scope for e in scan([d], rec))
+            inside = _scope_test(scope)
+            known = {p: k for p, k in known.items() if inside(p)}
         todo, alive = [], set()
-        for p, mod, st in scan(self.store.folders()):
+        for p, mod, st in entries:
             sp = str(p)
             alive.add(sp)
             k = known.get(sp)

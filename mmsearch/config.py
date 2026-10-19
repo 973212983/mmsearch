@@ -44,6 +44,7 @@ DEFAULT_SETTINGS = {
     "backend": "auto",
     "image_tokens": int(os.environ.get("MMSEARCH_IMAGE_TOKENS", 280)),
     "auto_index": True,
+    "watch": True,  # 监听已添加的文件夹，文件新增/修改/删除后自动更新索引
     "view": "grid",
     "hf_endpoint": HF_ENDPOINTS[0][0],
     "model_source": {"kind": "official"},
@@ -154,6 +155,9 @@ FULL_DIM = 768
 COARSE_DIM = 256
 # 粗排后用 768d 精排的候选数
 RERANK_CANDIDATES = 200
+# 混合检索：文字查询的关键词命中（文件名、正文）给向量相似度加分，最多加这么多（见 store.lexical）
+LEXICAL_BOOST = 0.1
+LEXICAL_CANDIDATES = 50  # 正文关键词命中取 bm25 最好的前 N 条
 
 # 文本切块
 TEXT_CHUNK_CHARS = 1200

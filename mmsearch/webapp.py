@@ -23,6 +23,7 @@ from .embedder import EmbedError, Embedder, LlamaServer, hold_background
 from .indexer import Indexer
 from .mediaserver import MediaServer
 from .store import Hit, VectorStore
+from .watcher import FolderWatcher
 
 WEB_DIR = config.RESOURCE_DIR / "mmsearch" / "web" if config.FROZEN else Path(__file__).parent / "web"
 FILTERS = {"all": None, "text": {"text"}, "image": {"image"}, "audio": {"audio"}, "video": {"video", "video_audio"}}
@@ -65,9 +66,13 @@ class Api:
         self._index_thread: threading.Thread | None = None
         self._index_state = {"running": False, "done": 0, "total": 0, "current": ""}
         self._reindex = False  # 索引进行中（或模型未就绪）时添加了文件夹：结束后再跑一轮
+        self._pending_scope: set[tuple[str, bool]] = set()  # 索引进行中时文件夹监听发现的变化，结束后再处理
+        self._index_lock = threading.Lock()  # 监听线程、索引结束、界面操作都可能同时 start_index
+        self._watcher = FolderWatcher(lambda scope: self.start_index(scope))
         self._download_cancel = False
         self._last_vec: np.ndarray | None = None
         self._last_exclude: str | None = None
+        self._last_text: str | None = None
         self._last_index_emit = 0.0
         self._hwnd = 0
         self._visible = False
@@ -131,6 +136,11 @@ class Api:
                 rebuilt = self._check_index_model()
                 if self._settings["auto_index"] or self._reindex or rebuilt:
                     self.start_index()
+                elif self._pending_scope:  # 重启模型期间监听到的变化
+                    with self._index_lock:
+                        pending, self._pending_scope = self._pending_scope, set()
+                    self.start_index(pending)
+                self._sync_watch()
             except Exception as e:
                 if gen != self._model_gen:
                     return
@@ -200,7 +210,7 @@ class Api:
         ext = p.suffix.lower()
         d = {"id": h.item_id, "path": h.path, "name": p.name, "dir": str(p.parent), "folder": p.parent.name,
              "kind": h.kind, "ext": ext.lstrip("."), "start": h.start, "end": h.end, "score": round(h.score, 4),
-             "mtime": h.mtime}
+             "mtime": h.mtime, "lexical": h.lexical}
         ms = self._media
         if h.kind == "text":
             d["snippet"] = h.snippet or ""
@@ -221,11 +231,13 @@ class Api:
             d["playable"] = ext in PLAYABLE
         return d
 
-    def _search_vec(self, vec: np.ndarray, t_enc: float = 0.0, exclude: str | None = None) -> dict:
-        """exclude：以已索引文件搜索时排除它自己，否则第一个结果永远是查询本身。"""
-        self._last_vec, self._last_exclude = vec, exclude
+    def _search_vec(self, vec: np.ndarray, t_enc: float = 0.0, exclude: str | None = None,
+                    text: str | None = None) -> dict:
+        """exclude：以已索引文件搜索时排除它自己，否则第一个结果永远是查询本身。text：文字查询原文（关键词加分）。"""
+        self._last_vec, self._last_exclude, self._last_text = vec, exclude, text
         t = time.time()
-        res = {k: [self._hit(h) for h in self._store.search(vec, k=TOP_K, kinds=kinds, exclude_path=exclude)]
+        lex = self._store.lexical(text) if text else None
+        res = {k: [self._hit(h) for h in self._store.search(vec, k=TOP_K, kinds=kinds, exclude_path=exclude, lex=lex)]
                for k, kinds in FILTERS.items()}
         return {"results": res, "enc_ms": round(t_enc * 1000), "search_ms": round((time.time() - t) * 1000, 1),
                 "total": len(self._store)}
@@ -246,7 +258,7 @@ class Api:
             self._need_model()
             t = time.time()
             vec = self._emb.encode_query(text.strip())
-            return self._search_vec(vec, time.time() - t)
+            return self._search_vec(vec, time.time() - t, text=text.strip())
         return self._wrap(run)
 
     def search_file(self, path: str) -> dict:
@@ -308,7 +320,7 @@ class Api:
         """索引更新后用上一次的查询向量重新检索（不需要重新编码）。"""
         if self._last_vec is None:
             return None
-        return self._search_vec(self._last_vec, exclude=self._last_exclude)
+        return self._search_vec(self._last_vec, exclude=self._last_exclude, text=self._last_text)
 
     def pick_query_file(self) -> dict | None:
         exts = sorted(config.IMAGE_EXT | config.AUDIO_EXT | config.VIDEO_EXT | config.TEXT_EXT | config.DOC_EXT)
@@ -387,6 +399,7 @@ class Api:
             if os.path.isdir(p):
                 self._store.add_folder(os.path.normpath(p))
         self._emit("overview", self.overview())
+        self._sync_watch()
         self.start_index()
 
     def remove_folder(self, path: str):
@@ -394,6 +407,7 @@ class Api:
         if running:  # 正在处理的文件可能属于这个文件夹，停下来，移除后再继续
             self._stop_index_and_wait()
         self._store.remove_folder(path)
+        self._sync_watch()
         self._emit("overview", self.overview())
         if running:
             self.start_index()
@@ -402,16 +416,29 @@ class Api:
         self._store.retry_failed()
         self.start_index()
 
-    def start_index(self):
-        if not self._store.folders():
-            return
-        if self._index_state["running"] or self._model["state"] != "ready":
-            self._reindex = True  # 当前一轮结束（或模型就绪）后再扫描一次，新加的文件夹不会被漏掉
-            return
-        self._reindex = False  # 新的一轮会完整扫描所有文件夹
-        self._indexer = Indexer(self._store, Embedder(self._server))  # 独立实例：停止索引不影响搜索
-        self._index_state = {"running": True, "done": 0, "total": 0, "current": "正在扫描文件…"}
+    def _sync_watch(self):
+        """按设置和当前文件夹列表开始/停止监听（模型就绪后才监听，之前的变化由启动时的扫描处理）。"""
+        on = self._settings.get("watch", True) and self._model["state"] == "ready"
+        self._watcher.set_folders(self._store.folders() if on else [])
+
+    def start_index(self, scope: set[tuple[str, bool]] | None = None):
+        """scope：文件夹监听发现的变化，只重新扫描这些目录（见 Indexer.run）；None 完整扫描所有文件夹。"""
+        with self._index_lock:
+            if not self._store.folders():
+                return
+            if self._index_state["running"] or self._model["state"] != "ready":
+                if scope is None:
+                    self._reindex = True  # 当前一轮结束（或模型就绪）后再扫描一次，新加的文件夹不会被漏掉
+                else:
+                    self._pending_scope |= scope
+                return
+            if scope is None:
+                self._reindex = False  # 新的一轮会完整扫描所有文件夹
+                self._pending_scope = set()
+            self._indexer = Indexer(self._store, Embedder(self._server))  # 独立实例：停止索引不影响搜索
+            self._index_state = {"running": True, "done": 0, "total": 0, "current": "正在扫描文件…"}
         self._emit("index", self._index_state)
+        failed_before = len(self._store.failed_files())
 
         def progress(done, total, msg):
             self._index_state = {"running": True, "done": done, "total": total,
@@ -424,7 +451,7 @@ class Api:
         def work():
             err = None
             try:
-                self._indexer.run(progress)
+                self._indexer.run(progress, scope)
             except Exception as e:
                 traceback.print_exc()
                 err = str(e)
@@ -432,9 +459,17 @@ class Api:
             self._index_state = {"running": False, "done": 0, "total": 0, "current": ""}
             self._emit("index", self._index_state)
             self._emit("overview", self.overview())
-            self._emit("index_done", {"error": err, "cancelled": cancelled, "failed": len(self._store.failed_files())})
-            if self._reindex and not cancelled and not err:
+            failed = len(self._store.failed_files())  # 监听触发的小范围更新只报告新增的失败，不反复提示旧的
+            self._emit("index_done", {"error": err, "cancelled": cancelled,
+                                      "failed": failed if scope is None else max(0, failed - failed_before)})
+            if cancelled or err:
+                return
+            if self._reindex:
                 self.start_index()
+            elif self._pending_scope:
+                with self._index_lock:
+                    pending, self._pending_scope = self._pending_scope, set()
+                self.start_index(pending)
 
         self._index_thread = threading.Thread(target=work, daemon=True)
         self._index_thread.start()
@@ -557,6 +592,8 @@ class Api:
             self._apply_native()
         if "bg_blur" in new:
             self._emit_backdrop()  # 磨砂底图的模糊是预先做好的，半径变了要重新生成
+        if "watch" in new:
+            self._sync_watch()
         if restart:
             self._restart_model()
         return self._settings_payload()
@@ -672,6 +709,7 @@ class Api:
             traceback.print_exc()
 
     def _shutdown(self):
+        self._watcher.stop()
         self.stop_index()
         self._server.stop()
         self._media.httpd.shutdown()

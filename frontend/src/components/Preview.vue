@@ -124,7 +124,8 @@ defineExpose({ togglePlay })
       <div class="meta">
         <span class="chip"><i :style="{ background: KINDS[h.kind]?.color }" />{{ KINDS[h.kind]?.label }} · {{ (h.ext || '—').toUpperCase() }}</span>
         <span v-if="seg" class="chip">片段 {{ seg }}</span>
-        <span class="chip" title="与查询的余弦相似度。不同类型文件的分数尺度不同（图片、音频普遍低于文档），只适合在同类结果之间比较">相似度 {{ h.score.toFixed(3) }}</span>
+        <span class="chip" title="与查询的余弦相似度（关键词命中的结果另有加分）。不同类型文件的分数尺度不同（图片、音频普遍低于文档），只适合在同类结果之间比较">相似度 {{ h.score.toFixed(3) }}</span>
+        <span v-if="h.lexical" class="chip" title="文件名或正文里出现了查询中的关键词">关键词命中</span>
         <template v-if="info?.exists"><span class="chip">{{ size(info.size) }}</span><span class="chip">{{ new Date(info.mtime * 1000).toLocaleDateString('zh-CN') }}</span></template>
         <span v-else-if="info" class="chip warn">文件已移动或删除</span>
       </div>

@@ -146,7 +146,72 @@ class VectorStoreReuseTests(StoreTestCase):
         self.assert_memory_matches_database()
 
 
+class LexicalSearchTests(StoreTestCase):
+    def put_doc(self, path: str, axis: int, snippet: str, kind: str = "text"):
+        self.store.put_file(path, 1.0, 1, kind, [{"kind": kind, "snippet": snippet}], vector(axis))
+
+    def test_exact_identifier_outranks_closer_vectors(self):
+        self.put_doc(r"C:\docs\near.md", 0, "general notes")
+        self.put_doc(r"C:\docs\api.md", 1, "calls acme.billing.fetchRemainingCredits")
+        q = vector(0)[0] * 0.74 + vector(1)[0] * 0.67  # 差距小于 LEXICAL_BOOST
+
+        self.assertEqual(r"C:\docs\near.md", self.store.search(q, k=1, boost=0)[0].path)
+        hit = self.store.search(q, k=1, lex=self.store.lexical("fetchRemainingCredits"))[0]
+        self.assertEqual(r"C:\docs\api.md", hit.path)
+        self.assertTrue(hit.lexical)
+
+    def test_file_name_match_pulls_in_files_outside_the_vector_candidates(self):
+        self.put_doc(r"C:\pics\482913_receipt.png", 5, "482913_receipt.png", kind="image")
+        self.put_doc(r"C:\docs\other.md", 0, "unrelated")
+
+        hits = self.store.search(vector(0)[0], k=5, kinds={"image"}, lex=self.store.lexical("482913"))
+        self.assertEqual([r"C:\pics\482913_receipt.png"], [h.path for h in hits])
+
+    def test_terms_may_match_folder_but_one_must_match_the_file_name(self):
+        self.put_doc(r"C:\proj\resetcounter\action.go", 0, "package x")
+        self.put_doc(r"C:\proj\resetcounter\register.go", 1, "package x")
+        self.put_doc(r"C:\proj\other\action.go", 2, "package y")
+
+        lex = self.store.lexical("resetcounter action.go")
+        paths = {self.store.item_path(i) for i in lex}
+        self.assertEqual({r"C:\proj\resetcounter\action.go"}, paths)
+        self.assertEqual({}, self.store.lexical("proj"))  # 只命中文件夹不算
+        self.assertEqual({}, self.store.lexical("a o"))  # 单个字母不算关键词
+
+    def test_short_terms_only_scan_file_names(self):
+        self.put_doc(r"C:\a\报告汇总.txt", 0, "没有关键词")
+        self.put_doc(r"C:\a\合同.txt", 1, "这里提到报告")
+
+        paths = {self.store.item_path(i) for i in self.store.lexical("报告")}
+        self.assertEqual({r"C:\a\报告汇总.txt"}, paths)
+
+    def test_keyword_index_follows_replaced_and_deleted_files(self):
+        self.put_doc(r"C:\a\x.txt", 0, "alpha keyword")
+        self.put_doc(r"C:\a\x.txt", 0, "beta keyword")
+        self.assertEqual({}, self.store.lexical("alpha"))
+        self.assertEqual(1, len(self.store.lexical("beta")))
+
+        self.store.clear()
+        self.assertEqual({}, self.store.lexical("beta"))
+        self.assertEqual({}, self.store.lexical("x.txt"))
+        self.store.db.execute("INSERT INTO items_fts(items_fts) VALUES('integrity-check')")
+        self.store.db.execute("INSERT INTO paths_fts(paths_fts) VALUES('integrity-check')")
+
+
 class VectorStoreMigrationTests(unittest.TestCase):
+    def test_opening_a_database_without_keyword_index_builds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "index.db"
+            store = VectorStore(path)
+            store.put_file(r"C:\a\report.txt", 1.0, 1, "text", [{"kind": "text", "snippet": "quarterly"}], vector(0))
+            store.db.executescript("DROP TABLE paths_fts; DROP TABLE items_fts;")
+            store.db.close()
+
+            store = VectorStore(path)
+            self.assertEqual(1, len(store.lexical("quarterly")))
+            self.assertEqual(1, len(store.lexical("report")))
+            store.db.close()
+
     def test_opening_an_old_database_adds_the_hash_column(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "index.db"

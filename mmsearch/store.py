@@ -39,6 +39,27 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);  -- 如 model
 CREATE INDEX IF NOT EXISTS idx_files_error ON files(path) WHERE error IS NOT NULL;
 """
 
+# 关键词索引（FTS5 trigram：中英文都按任意子串匹配，不需要分词）。向量检索对文件名、代码标识符、
+# 单号、精确短语不敏感，这些靠关键词命中给结果加分。两张都是外部内容表（不重复存正文），由触发器保持同步。
+# paths_fts：文件路径（rowid = files.id）；items_fts：文本块（rowid = items.id）
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS paths_fts USING fts5(path, content='files', content_rowid='id', tokenize='trigram');
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(snippet, content='items', content_rowid='id',
+                                                        tokenize='trigram');
+CREATE TRIGGER IF NOT EXISTS files_fts_ai AFTER INSERT ON files BEGIN
+    INSERT INTO paths_fts(rowid, path) VALUES (new.id, new.path);
+END;
+CREATE TRIGGER IF NOT EXISTS files_fts_ad AFTER DELETE ON files BEGIN
+    INSERT INTO paths_fts(paths_fts, rowid, path) VALUES ('delete', old.id, old.path);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, snippet) VALUES (new.id, new.snippet);
+END;
+CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, snippet) VALUES ('delete', old.id, old.snippet);
+END;
+"""
+
 
 @dataclass
 class Hit:
@@ -50,6 +71,7 @@ class Hit:
     end: float | None
     snippet: str | None
     mtime: float | None = None
+    lexical: bool = False  # 关键词命中（文件名或正文），score 里含 LEXICAL_BOOST 加分
 
 
 def _normalize(m: np.ndarray) -> np.ndarray:
@@ -68,6 +90,11 @@ class VectorStore:
         if "hash" not in {r[1] for r in self.db.execute("PRAGMA table_info(files)")}:
             self.db.execute("ALTER TABLE files ADD COLUMN hash TEXT")  # 旧版索引库：之前的记录没有指纹
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_files_hash ON files(hash) WHERE hash IS NOT NULL")
+        new_fts = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='paths_fts'").fetchone()
+        self.db.executescript(FTS_SCHEMA)
+        if new_fts:  # 旧版索引库：给已有记录补上关键词索引
+            self.db.execute("INSERT INTO paths_fts(paths_fts) VALUES ('rebuild')")
+            self.db.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
         self.db.commit()
         self.lock = threading.RLock()
         self._load()
@@ -314,9 +341,13 @@ class VectorStore:
 
     # ---------- 检索 ----------
     def search(self, q: np.ndarray, k: int = 50, kinds: set[str] | None = None,
-               dedup_files: bool = True, exclude_path: str | None = None) -> list[Hit]:
-        """两阶段检索：256d 粗排 → 768d 精排。q: (768,) 已归一化。exclude_path：排除查询文件自身（找相似）。"""
+               dedup_files: bool = True, exclude_path: str | None = None,
+               lex: dict[int, float] | None = None, boost: float = config.LEXICAL_BOOST) -> list[Hit]:
+        """两阶段检索：256d 粗排 → 768d 精排。q: (768,) 已归一化。exclude_path：排除查询文件自身（找相似）。
+        lex：lexical(文字查询) 的结果，命中的条目（不在向量候选里的也补进来）得分加 boost × 命中强度。
+        各类型标签共用同一个查询，lex 只需算一次。"""
         q = np.asarray(q, dtype=np.float32).reshape(-1)
+        lex = lex if boost > 0 else None
         with self.lock:
             ids, item_kinds, full, coarse = self.ids, self.kinds, self.full, self.coarse
             if not len(ids):
@@ -330,13 +361,65 @@ class VectorStore:
             n_cand = min(len(scores), max(config.RERANK_CANDIDATES, k * 4))
             cand = np.argpartition(-scores, n_cand - 1)[:n_cand]
             cand = cand[np.isfinite(scores[cand])]
-            fine = full[cand].astype(np.float32) @ q
+            bonus = np.zeros(len(cand), np.float32)
+            if lex:
+                pos = np.array([p for p in map(self._positions.get, lex) if p is not None and p < len(ids)], np.int64)
+                if mask is not None:
+                    pos = pos[mask[pos]]
+                cand = np.union1d(cand, pos)
+                bonus = boost * np.array([lex.get(int(i), 0.0) for i in ids[cand]], np.float32)
+            fine = full[cand].astype(np.float32) @ q + bonus
             fine_order = np.argsort(-fine)
             ordered_ids = ids[cand[fine_order]].copy()
             ordered_scores = fine[fine_order].copy()
-        return self._hits(ordered_ids, ordered_scores, k, dedup_files, exclude_path)
+            ordered_lex = bonus[fine_order] > 0
+        return self._hits(ordered_ids, ordered_scores, k, dedup_files, exclude_path, ordered_lex)
 
-    def _hits(self, item_ids, scores, k, dedup_files, exclude_path=None) -> list[Hit]:
+    def lexical(self, text: str) -> dict[int, float]:
+        """关键词命中：{item_id: 强度 0~1}。查询按空白拆词，所有词都要出现（AND）。
+        - 正文：按 bm25 相对最佳结果的比例给强度。
+        - 文件：所有词都出现在路径里、且至少一个词在文件名里（「项目A 报价」这样带上文件夹也能找到）。
+          强度看查询词占文件名主干的比例（搜的就是这个文件名时为 1），以及命中的文件少不少（单号、编号这类
+          只有一两个文件含有的词也算精确命中），取较大者。
+        trigram 只能索引 3 个字符以上的词：有长词时用 FTS 查，短词（如两个字的中文词）只在路径上补充过滤；
+        全是短词时只在路径里做子串扫描（路径表小，扫描很快），不查正文。"""
+        # 单个英文字母/数字几乎每个路径都有，不算关键词
+        terms = list(dict.fromkeys(t.lower() for t in text.split() if len(t) > 1 or not t.isascii()))
+        long_terms = [t for t in terms if len(t) >= 3]
+        if not terms:
+            return {}
+        n = config.LEXICAL_CANDIDATES
+        out: dict[int, float] = {}
+        with self.lock:
+            if long_terms:
+                match = " AND ".join('"' + t.replace('"', '""') + '"' for t in long_terms)
+                paths = self.db.execute("SELECT rowid, path FROM paths_fts WHERE paths_fts MATCH ? LIMIT ?",
+                                        (match, n * 4)).fetchall()
+                rows = self.db.execute("SELECT rowid, bm25(items_fts) FROM items_fts WHERE items_fts MATCH ? "
+                                       "ORDER BY rank LIMIT ?", (match, n)).fetchall()
+                if rows:
+                    best = rows[0][1] or -1.0  # bm25 越小越好（负数）
+                    for iid, s in rows:
+                        out[iid] = max(0.05, min(1.0, s / best)) if best < 0 else 1.0
+            else:
+                like = " AND ".join("instr(lower(path), ?) > 0" for _ in terms)
+                paths = self.db.execute(f"SELECT id, path FROM files WHERE {like} LIMIT ?", (*terms, n * 4)).fetchall()
+            files = {}
+            for fid, path in paths:
+                path = path.lower()
+                name = os.path.basename(path)
+                in_name = [t for t in terms if t in name]
+                if in_name and all(t in path for t in terms):
+                    files[fid] = sum(map(len, in_name)) / max(len(os.path.splitext(name)[0]), 1)
+            if files:
+                specific = 3 / len(files)
+                fids = list(files)
+                q = ",".join("?" * len(fids))
+                for iid, fid in self.db.execute(f"SELECT id, file_id FROM items WHERE file_id IN ({q})", fids):
+                    out[iid] = max(out.get(iid, 0.0), min(1.0, max(files[fid], specific, 0.2)))
+        return out
+
+    def _hits(self, item_ids, scores, k, dedup_files, exclude_path=None, lexical=None) -> list[Hit]:
         out, seen = [], set()
         id_list = [int(i) for i in item_ids]
         if not id_list:
@@ -347,7 +430,7 @@ class VectorStore:
                 f"SELECT items.id, files.path, items.kind, items.start, items.end, items.snippet, files.id, files.mtime "
                 f"FROM items JOIN files ON files.id=items.file_id WHERE items.id IN ({q})", id_list)}
         skip = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else None
-        for iid, s in zip(id_list, scores):
+        for i, (iid, s) in enumerate(zip(id_list, scores)):
             r = rows.get(iid)
             if r is None:
                 continue
@@ -356,7 +439,7 @@ class VectorStore:
             seen.add(r[6])
             if skip and os.path.normcase(r[1]) == skip:
                 continue
-            out.append(Hit(iid, float(s), r[1], r[2], r[3], r[4], r[5], r[7]))
+            out.append(Hit(iid, float(s), r[1], r[2], r[3], r[4], r[5], r[7], bool(lexical is not None and lexical[i])))
             if len(out) >= k:
                 break
         return out

@@ -61,19 +61,24 @@ class MediaServer:
     # ---------------- 内容生成 ----------------
     def thumb(self, path: str, t: float | None, w: int) -> bytes:
         st = os.stat(path)
-        key = hashlib.sha1(f"{path}|{st.st_mtime}|{t}|{w}".encode()).hexdigest()
+        key = hashlib.sha1(f"{path}|{st.st_mtime}|{t}|{w}|rgb2".encode()).hexdigest()  # rgb2：透明图改铺底色后，旧缓存作废
         f = CACHE_DIR / f"{key}.jpg"
         if f.exists():
             return f.read_bytes()
         p = Path(path)
         if config.modality_of(p) == "image":
             img = media.load_image(p, max_side=w)
+        elif p.suffix.lower() == ".pdf":  # 扫描页：t 是页码（从 1 开始）
+            img = media.pdf_page_image(p, int(t or 1) - 1)
+            if img is None:
+                raise FileNotFoundError("no page image")
+            img.thumbnail((w, w))
         else:
             img = media.sample_frames(p, [t or 0.0], max_side=w)[0]
             if img is None:
                 raise FileNotFoundError("no frame")
         buf = io.BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=84)
+        media.to_rgb(img).save(buf, "JPEG", quality=84)
         data = buf.getvalue()
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         f.write_bytes(data)

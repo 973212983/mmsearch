@@ -218,17 +218,34 @@ class Indexer:
         docs, ok = [], []
         for p, mod, st, fp in files:
             try:
-                chunks = media.file_chunks(p)
+                chunks, pages = self._text_parts(p)
             except Exception as e:
                 traceback.print_exc()
                 self.store.put_file(str(p), st.st_mtime, st.st_size, "text", [], None, error=repr(e), fp=fp)
                 continue
-            ok.append((p, st, fp, chunks, len(docs)))
+            ok.append((p, st, fp, chunks, pages, len(docs)))
             docs += [(p.name, c) for c in chunks]
         vecs = self.emb.encode_titled(docs) if docs else None  # 多个小文件的块合进同一批请求
-        for p, st, fp, chunks, s in ok:
-            self.store.put_file(str(p), st.st_mtime, st.st_size, "text", [{"kind": "text", "snippet": c} for c in chunks],
-                                vecs[s: s + len(chunks)] if chunks else None, fp=fp)
+        for p, st, fp, chunks, pages, s in ok:
+            items = [{"kind": "text", "snippet": c} for c in chunks]
+            parts = [vecs[s: s + len(chunks)]] if chunks else []
+            if pages:  # 扫描页按图片编码，start 记页码（从 1 开始），缩略图和预览按页码取图
+                items += [{"kind": "page", "start": i + 1, "snippet": f"第 {i + 1} 页"} for i, _ in pages]
+                parts.append(self.emb.encode_images([img for _, img in pages]))
+            self.store.put_file(str(p), st.st_mtime, st.st_size, "text", items,
+                                np.concatenate(parts) if parts else None, fp=fp)
+
+    @staticmethod
+    def _text_parts(p: Path) -> tuple[list[str], list]:
+        """(文本块, 扫描页 [(页码, 图片)])。只有 PDF 会有扫描页；什么都读不出的 PDF 抛出说明原因的错误。"""
+        if p.suffix.lower() != ".pdf":
+            return media.file_chunks(p), []
+        text, empty = media.read_pdf(p)
+        chunks = media.chunk_text(text)
+        pages = media.pdf_scan_pages(p, empty[: config.SCANNED_PDF_MAX_PAGES]) if empty else []
+        if not chunks and not pages and empty:
+            raise ValueError("PDF 没有文字层，页面也不是整页扫描图片（可能是画成矢量轮廓的文字），读不出内容")
+        return chunks, pages
 
     def _index_images(self, batch):
         imgs, ok = [], []
@@ -241,9 +258,9 @@ class Indexer:
         if not imgs:
             return
         vecs = self.emb.encode_images(imgs)
-        for (p, st, fp), v in zip(ok, vecs):
+        for (p, st, fp), v, img in zip(ok, vecs, imgs):
             self.store.put_file(str(p), st.st_mtime, st.st_size, "image",
-                                [{"kind": "image", "snippet": p.name}], v[None], fp=fp)
+                                [{"kind": "image", "snippet": p.name}], v[None], fp=fp, dhash=media.dhash(img))
 
     def _index_media(self, files):
         p, mod, st, fp = files[0]  # 音视频一个文件一个任务
@@ -267,10 +284,17 @@ class Indexer:
 
         if mod == "video":
             items, vecs = [], []
+            last = None  # (小图, 向量)：最近一次真正编码的画面段。和它比（而不是和上一段比），缓慢变化不会被一路复用下去
             # 逐段编码，下一段的帧（最后是音轨）在后台线程里同时解码：GPU 不用等抽帧，长视频也不会占满内存
             with contextlib.closing(_prefetch(self._video_units(p))) as units:
                 for kind, start, end, data in units:
-                    vecs.append(self.emb.encode_videos([data]) if kind == "video" else self.emb.encode_audios([data]))
+                    if kind == "video":
+                        small = media.frame_thumbs(data)
+                        if last is None or media.frames_diff(small, last[0]) >= config.VIDEO_STATIC_DIFF:
+                            last = (small, self.emb.encode_videos([data]))
+                        vecs.append(last[1])  # 画面没变（录屏、静止镜头）直接复用
+                    else:
+                        vecs.append(self.emb.encode_audios([data]))
                     items.append({"kind": kind, "start": start, "end": end})
             return (items, np.concatenate(vecs)) if items else ([], None)
         raise ValueError(mod)

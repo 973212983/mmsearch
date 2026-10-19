@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import webview
 
-from . import config, media, shell
+from . import config, media, query, shell
 from .downloader import DownloadCancelled, download_models
 from .embedder import EmbedError, Embedder, LlamaServer, hold_background
 from .indexer import Indexer
@@ -26,7 +26,7 @@ from .store import Hit, VectorStore
 from .watcher import FolderWatcher
 
 WEB_DIR = config.RESOURCE_DIR / "mmsearch" / "web" if config.FROZEN else Path(__file__).parent / "web"
-FILTERS = {"all": None, "text": {"text"}, "image": {"image"}, "audio": {"audio"}, "video": {"video", "video_audio"}}
+FILTERS = {"all": None, "text": {"text", "page"}, "image": {"image"}, "audio": {"audio"}, "video": {"video", "video_audio"}}
 TOP_K = 120
 PLAYABLE = {".mp4", ".m4v", ".webm", ".mov", ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
 
@@ -73,6 +73,8 @@ class Api:
         self._last_vec: np.ndarray | None = None
         self._last_exclude: str | None = None
         self._last_text: str | None = None
+        self._last_filters: query.Filters | None = None
+        self._base: tuple[np.ndarray, str | None] | None = None  # 最近一次以图搜索的 (向量, 排除的文件)
         self._last_index_emit = 0.0
         self._hwnd = 0
         self._visible = False
@@ -158,7 +160,7 @@ class Api:
         if old is None or old == fp or not self._store.stats()["items"]:
             return False  # 旧版索引库没有记录：当作就是当前模型建的
         self._store.clear()
-        self._last_vec = None
+        self._last_vec = self._last_filters = None
         self._emit("overview", self.overview())
         self._toast("已更换模型，正在用新模型重建索引")
         return True
@@ -215,10 +217,11 @@ class Api:
         if h.kind == "text":
             d["snippet"] = h.snippet or ""
             d["code"] = ext in config.CODE_EXT
-        elif h.kind == "image":
-            d["icon"] = ms.url("thumb", h.path, w=96)
-            d["thumb"] = ms.url("thumb", h.path, w=480)
-            d["full"] = ms.url("thumb", h.path, w=1800)
+        elif h.kind in ("image", "page"):  # page：扫描版 PDF 的一页，start 是页码
+            t = {"t": int(h.start or 1)} if h.kind == "page" else {}
+            d["icon"] = ms.url("thumb", h.path, w=96, **t)
+            d["thumb"] = ms.url("thumb", h.path, w=480, **t)
+            d["full"] = ms.url("thumb", h.path, w=1800, **t)
         else:
             mid = ((h.start or 0) + (h.end or h.start or 0)) / 2
             if h.kind in ("video", "video_audio"):
@@ -231,16 +234,23 @@ class Api:
             d["playable"] = ext in PLAYABLE
         return d
 
-    def _search_vec(self, vec: np.ndarray, t_enc: float = 0.0, exclude: str | None = None,
-                    text: str | None = None) -> dict:
-        """exclude：以已索引文件搜索时排除它自己，否则第一个结果永远是查询本身。text：文字查询原文（关键词加分）。"""
-        self._last_vec, self._last_exclude, self._last_text = vec, exclude, text
+    def _search_vec(self, vec: np.ndarray | None, t_enc: float = 0.0, exclude: str | None = None,
+                    text: str | None = None, filters: query.Filters | None = None) -> dict:
+        """exclude：以已索引文件搜索时排除它自己，否则第一个结果永远是查询本身。text：文字查询原文（关键词加分）。
+        filters：时间、类型、文件夹条件；vec 为 None 表示只有过滤条件，按修改时间列出文件。"""
+        self._last_vec, self._last_exclude, self._last_text, self._last_filters = vec, exclude, text, filters
         t = time.time()
-        lex = self._store.lexical(text) if text else None
-        res = {k: [self._hit(h) for h in self._store.search(vec, k=TOP_K, kinds=kinds, exclude_path=exclude, lex=lex)]
-               for k, kinds in FILTERS.items()}
+        files = self._store.filter_files(filters) if filters else None
+        if vec is None:
+            res = {k: [{**self._hit(h), "score": None} for h in self._store.browse(files, k=TOP_K, kinds=kinds)]
+                   for k, kinds in FILTERS.items()}
+        else:
+            lex = self._store.lexical(text) if text else None
+            res = {k: [self._hit(h) for h in self._store.search(vec, k=TOP_K, kinds=kinds, exclude_path=exclude,
+                                                                 lex=lex, files=files)]
+                   for k, kinds in FILTERS.items()}
         return {"results": res, "enc_ms": round(t_enc * 1000), "search_ms": round((time.time() - t) * 1000, 1),
-                "total": len(self._store)}
+                "total": len(self._store), "filters": filters.labels if filters else [], "text": text or ""}
 
     def _need_model(self):
         if self._model["state"] != "ready":
@@ -255,10 +265,13 @@ class Api:
 
     def search_text(self, text: str) -> dict:
         def run():
+            clean, filters = query.parse(text)
+            if not clean and filters:  # 只有过滤条件（如「上周 ext:png」）：不需要模型
+                return self._search_vec(None, filters=filters)
             self._need_model()
             t = time.time()
-            vec = self._emb.encode_query(text.strip())
-            return self._search_vec(vec, time.time() - t, text=text.strip())
+            vec = self._emb.encode_query(clean or text.strip())
+            return self._search_vec(vec, time.time() - t, text=clean or text.strip(), filters=filters or None)
         return self._wrap(run)
 
     def search_file(self, path: str) -> dict:
@@ -288,6 +301,7 @@ class Api:
                 if not chunks:
                     raise ValueError("文件没有文本内容")
                 vec = self._emb.encode_documents(chunks[:1], title=p.name)[0]
+            self._base = (vec, path)
             r = self._search_vec(vec, time.time() - t, exclude=path)
             r["query"] = {"kind": mod, "name": p.name, "path": path,
                           "thumb": self._media.url("thumb", path, w=160) if mod in ("image", "video") else None}
@@ -302,9 +316,10 @@ class Api:
             import io
             from PIL import Image
             raw = base64.b64decode(data_url.split(",", 1)[1])
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            img = media.to_rgb(Image.open(io.BytesIO(raw)))
             t = time.time()
             vec = self._emb.encode_images([img])[0]
+            self._base = (vec, None)
             return self._search_vec(vec, time.time() - t)
         return self._wrap(run)
 
@@ -313,14 +328,65 @@ class Api:
             vec = self._store.vector(int(item_id))
             if vec is None:
                 raise ValueError("该条目已不在索引中")
-            return self._search_vec(vec, exclude=self._store.item_path(int(item_id)))
+            self._base = (vec, self._store.item_path(int(item_id)))
+            return self._search_vec(vec, exclude=self._base[1])
         return self._wrap(run)
+
+    def search_refine(self, text: str) -> dict:
+        """以图（文件、粘贴的图、找相似）搜索后再补一句文字，如「夜景」「有人的」：两个向量加权相加。
+        文字为空时回到原来的以图搜索；也支持过滤条件（如「上周」「in:相册」）。"""
+        def run():
+            if self._base is None:
+                raise ValueError("没有可以补充描述的图片查询")
+            base, exclude = self._base
+            clean, filters = query.parse(text)
+            if not clean:
+                return self._search_vec(base, exclude=exclude, filters=filters or None)
+            self._need_model()
+            t = time.time()
+            w = config.COMPOSE_TEXT_WEIGHT
+            vec = (1 - w) * base + w * self._emb.encode_query(clean)
+            vec = vec / np.linalg.norm(vec)
+            return self._search_vec(vec, time.time() - t, exclude=exclude, text=clean, filters=filters or None)
+        return self._wrap(run)
+
+    def find_similar_images(self, level: str = "same") -> dict:
+        """整理图片：内容几乎相同（副本、缩放、重新压缩，按 dHash）或相似（连拍、同一场景，按已有向量）的分组。"""
+        def run():
+            if level == "same":
+                self._fill_dhash()
+                groups = self._store.duplicate_groups()
+            else:
+                groups = self._store.similar_groups(config.IMAGE_SIMILAR_THRESHOLD)
+            out = []
+            for g in groups:
+                hits = [self._hit(h) for h in g]
+                for d in hits:
+                    try:
+                        d["size"] = os.path.getsize(d["path"])
+                    except OSError:
+                        d["size"] = None
+                out.append(hits)
+            return {"groups": out}
+        return self._wrap(run)
+
+    def _fill_dhash(self):
+        """补算旧版索引里图片的 dHash（新建索引时已顺带算好）。小尺寸解码，几千张十几秒，算一次存下来。"""
+        rows = []
+        for fid, path in self._store.missing_dhash():
+            try:
+                rows.append((fid, media.dhash(media.load_image(Path(path), max_side=256))))
+            except Exception:
+                rows.append((fid, 0))  # 读不了的（已删除、损坏）不参与比较
+        if rows:
+            self._store.set_dhash(rows)
 
     def rerun(self) -> dict | None:
         """索引更新后用上一次的查询向量重新检索（不需要重新编码）。"""
-        if self._last_vec is None:
+        if self._last_vec is None and not self._last_filters:
             return None
-        return self._search_vec(self._last_vec, exclude=self._last_exclude, text=self._last_text)
+        return self._search_vec(self._last_vec, exclude=self._last_exclude, text=self._last_text,
+                                filters=self._last_filters)
 
     def pick_query_file(self) -> dict | None:
         exts = sorted(config.IMAGE_EXT | config.AUDIO_EXT | config.VIDEO_EXT | config.TEXT_EXT | config.DOC_EXT)
@@ -338,7 +404,7 @@ class Api:
 
     # ================================================================ 文件操作
     def open(self, path: str, start: float | None = None, kind: str = ""):
-        vlc = find_vlc() if start is not None and kind != "text" else None
+        vlc = find_vlc() if start is not None and kind not in ("text", "page") else None
         if vlc:
             subprocess.Popen([vlc, f"--start-time={int(start)}", path])
         else:
@@ -435,13 +501,16 @@ class Api:
             if scope is None:
                 self._reindex = False  # 新的一轮会完整扫描所有文件夹
                 self._pending_scope = set()
-            self._indexer = Indexer(self._store, Embedder(self._server))  # 独立实例：停止索引不影响搜索
+            emb = Embedder(self._server)  # 独立实例：停止索引不影响搜索
+            emb.pause_reason = lambda: shell.busy_reason() if self._settings.get("pause_busy", True) else None
+            emb.on_pause = self._on_index_pause
+            self._indexer = Indexer(self._store, emb)
             self._index_state = {"running": True, "done": 0, "total": 0, "current": "正在扫描文件…"}
         self._emit("index", self._index_state)
         failed_before = len(self._store.failed_files())
 
         def progress(done, total, msg):
-            self._index_state = {"running": True, "done": done, "total": total,
+            self._index_state = {"running": True, "done": done, "total": total, "paused": self._index_state.get("paused"),
                                  "current": Path(msg).name if os.sep in msg else msg}
             if time.time() - self._last_index_emit > 0.25 or done == total:
                 self._last_index_emit = time.time()
@@ -474,6 +543,10 @@ class Api:
         self._index_thread = threading.Thread(target=work, daemon=True)
         self._index_thread.start()
 
+    def _on_index_pause(self, reason: str | None):
+        self._index_state = {**self._index_state, "paused": reason}
+        self._emit("index", self._index_state)
+
     def stop_index(self):
         if self._indexer:
             self._indexer.cancelled = True
@@ -486,7 +559,7 @@ class Api:
     def clear_index(self, which: str):
         self._stop_index_and_wait()
         self._store.clear({"image", "video"} if which == "visual" else None)
-        self._last_vec = None
+        self._last_vec = self._last_filters = None
         self._emit("overview", self.overview())
         self.start_index()
 

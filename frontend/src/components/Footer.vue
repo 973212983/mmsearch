@@ -16,6 +16,7 @@ const go = (v) => (S.view = S.view === v ? 'search' : v)
     <button class="status" :title="S.model.state === 'error' ? S.model.error : '索引管理（Ctrl+I）'" @click="go(S.model.state === 'error' ? 'settings' : 'index')">
       <template v-if="S.model.state === 'loading' || S.model.state === 'idle'"><span class="spinner" /> 正在加载模型</template>
       <template v-else-if="S.model.state === 'error'"><span class="dot err" /> 模型启动失败</template>
+      <template v-else-if="S.index.running && S.index.paused"><span class="dot pause" /> 索引已暂停（{{ S.index.paused }}） {{ S.index.done }}/{{ S.index.total || '…' }}</template>
       <template v-else-if="S.index.running">
         <svg viewBox="0 0 20 20" width="14" height="14" aria-hidden="true">
           <circle cx="10" cy="10" r="8" fill="none" stroke="var(--line-2)" stroke-width="3.5" />
@@ -59,6 +60,7 @@ const go = (v) => (S.view = S.view === v ? 'search' : v)
 .dot { width: 7px; height: 7px; border-radius: 4px; }
 .dot.ok { background: var(--ok); }
 .dot.err { background: var(--err); }
+.dot.pause { background: var(--text-3); }
 .hints { margin-left: auto; display: flex; gap: 14px; white-space: nowrap; }
 .hints span { display: flex; align-items: center; gap: 5px; }
 </style>

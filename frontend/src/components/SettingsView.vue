@@ -140,6 +140,10 @@ async function clear(which) {
         <div><b>实时更新索引</b><span>文件夹里新增、修改、删除文件后自动处理</span></div>
         <input :checked="S.settings.watch" type="checkbox" class="switch" @change="set({ watch: $event.target.checked })" />
       </label>
+      <label class="row">
+        <div><b>用电池或全屏时暂停索引</b><span>索引会让显卡满载：省电，也不和游戏、视频、演示抢显卡</span></div>
+        <input :checked="S.settings.pause_busy !== false" type="checkbox" class="switch" @change="set({ pause_busy: $event.target.checked })" />
+      </label>
       <div class="row">
         <div><b>模型下载源</b></div>
         <select :value="S.settings.hf_endpoint" @change="set({ hf_endpoint: $event.target.value })"><option v-for="[u, n] in S.boot.endpoints" :key="u" :value="u">{{ n }}</option></select>

@@ -3,5 +3,7 @@
  {"q": "parseConfig", "expect": ["src/config/loader.go"], "tab": "text", "tag": "lexical"},
  {"q": "去年夏天在海边拍的日落", "expect": ["Pictures/2025/beach"], "tab": "image", "tag": "semantic"},
  {"q": "介绍公司年度预算的会议录音", "expect": ["meetings/budget"], "tab": "audio", "tag": "semantic"},
- {"q": "项目A 报价", "expect": ["项目A/报价单"], "tab": "all", "tag": "mixed"}
+ {"q": "项目A 报价", "expect": ["项目A/报价单"], "tab": "all", "tag": "mixed"},
+ {"image": "D:/Pictures/2025/beach/IMG_0412.jpg", "expect": ["Pictures/2025/beach/IMG_0413"], "tab": "image", "tag": "img-img"},
+ {"image": "D:/Pictures/2025/beach/IMG_0412.jpg", "q": "晚上", "expect": ["Pictures/2025/beach/IMG_0450"], "tab": "image", "tag": "img-compose"}
 ]

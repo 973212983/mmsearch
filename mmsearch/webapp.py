@@ -17,10 +17,10 @@ from pathlib import Path
 import numpy as np
 import webview
 
-from . import config, media, query, shell
+from . import config, hubs, media, query, shell
 from .downloader import DownloadCancelled, download_models
 from .embedder import EmbedError, Embedder, LlamaServer, hold_background
-from .indexer import Indexer
+from .indexer import Indexer, fingerprint
 from .mediaserver import MediaServer
 from .store import Hit, VectorStore
 from .watcher import FolderWatcher
@@ -75,6 +75,7 @@ class Api:
         self._last_text: str | None = None
         self._last_filters: query.Filters | None = None
         self._base: tuple[np.ndarray, str | None] | None = None  # 最近一次以图搜索的 (向量, 排除的文件)
+        self._exclude_fp: tuple[str, str] | None = None  # 以文件搜索的 (路径, 内容指纹)：文件不在索引里也能排除它的副本
         self._last_index_emit = 0.0
         self._hwnd = 0
         self._visible = False
@@ -143,6 +144,10 @@ class Api:
                         pending, self._pending_scope = self._pending_scope, set()
                     self.start_index(pending)
                 self._sync_watch()
+                try:
+                    self._store.set_hub_bank(hubs.bank_vectors(self._emb))  # 首次约 80 条查询，之后读缓存
+                except Exception:
+                    traceback.print_exc()  # 只影响图片排序，不影响使用
             except Exception as e:
                 if gen != self._model_gen:
                     return
@@ -198,6 +203,7 @@ class Api:
         self._model_gen += 1  # 先让进行中的启动线程失效，它被中断时不会报“启动失败”
         self._stop_index_and_wait()
         self._server.stop()  # 让进行中的启动放弃
+        self._store.set_hub_bank(None)  # 可能换了模型，旧的查询向量不能再用
         self._server.backend = self._settings["backend"]
         self._server.image_tokens = self._settings["image_tokens"]
         self._model = {"state": "idle", "device": "", "error": ""}
@@ -212,7 +218,7 @@ class Api:
         ext = p.suffix.lower()
         d = {"id": h.item_id, "path": h.path, "name": p.name, "dir": str(p.parent), "folder": p.parent.name,
              "kind": h.kind, "ext": ext.lstrip("."), "start": h.start, "end": h.end, "score": round(h.score, 4),
-             "mtime": h.mtime, "lexical": h.lexical}
+             "mtime": h.mtime, "lexical": h.lexical, "copies": h.copies}
         ms = self._media
         if h.kind == "text":
             d["snippet"] = h.snippet or ""
@@ -246,8 +252,10 @@ class Api:
                    for k, kinds in FILTERS.items()}
         else:
             lex = self._store.lexical(text) if text else None
+            xfp = self._exclude_fp[1] if exclude and self._exclude_fp and self._exclude_fp[0] == exclude else None
+            hub = config.HUB_PENALTY if text else 0.0
             res = {k: [self._hit(h) for h in self._store.search(vec, k=TOP_K, kinds=kinds, exclude_path=exclude,
-                                                                 lex=lex, files=files)]
+                                                                 lex=lex, files=files, exclude_hash=xfp, hub=hub)]
                    for k, kinds in FILTERS.items()}
         return {"results": res, "enc_ms": round(t_enc * 1000), "search_ms": round((time.time() - t) * 1000, 1),
                 "total": len(self._store), "filters": filters.labels if filters else [], "text": text or ""}
@@ -282,6 +290,10 @@ class Api:
             if mod is None:
                 raise ValueError(f"不支持用 {p.suffix or '这种'} 文件搜索")
             self._media.allow(path)
+            try:
+                self._exclude_fp = (path, fingerprint(p, mod, p.stat().st_size))
+            except OSError:
+                self._exclude_fp = None
             t = time.time()
             if mod == "image":
                 vec = self._emb.encode_images([media.load_image(p)])[0]

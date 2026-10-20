@@ -47,7 +47,7 @@ watch(() => [S.cursor, rows.value], async () => {
           <i v-if="r.hit.kind === 'video' || r.hit.kind === 'video_audio'" class="play"><Icon name="play" :size="9" /></i>
         </span>
         <span class="txt">
-          <span class="name">{{ r.hit.name }}</span>
+          <span class="name">{{ r.hit.name }}<em v-if="r.hit.copies?.length" class="copies" :title="'内容相同的副本：\n' + r.hit.copies.join('\n')">+{{ r.hit.copies.length }} 个副本</em></span>
           <span class="sub">{{ sub(r.hit) }}</span>
         </span>
         <span class="date" :title="r.hit.mtime ? '修改于 ' + new Date(r.hit.mtime * 1000).toLocaleString('zh-CN') : ''">{{ fmtDate(r.hit.mtime) }}</span>
@@ -83,6 +83,7 @@ watch(() => [S.cursor, rows.value], async () => {
 .play { position: absolute; right: 2px; bottom: 2px; width: 15px; height: 15px; display: grid; place-items: center; padding-left: 1px; border-radius: 4px; background: rgba(0, 0, 0, .6); color: #fff; }
 .txt { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .name { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.copies { margin-left: 8px; font-size: 11px; font-style: normal; font-weight: 400; color: var(--text-3); }
 .sub { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
 .date { flex: none; font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 .row.sel .date { color: var(--text-2); }

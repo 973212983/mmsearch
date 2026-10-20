@@ -108,6 +108,10 @@ defineExpose({ togglePlay })
       <div class="title">
         <h2 :title="h.name">{{ h.name }}</h2>
         <button class="loc" :title="'在资源管理器中显示\n' + h.path" @click="openHit(h, true)">{{ h.dir }}</button>
+        <details v-if="h.copies?.length" class="copies">
+          <summary>另有 {{ h.copies.length }} 个内容相同的副本</summary>
+          <button v-for="p in h.copies" :key="p" class="loc" :title="'在资源管理器中显示\n' + p" @click="openHit({ ...h, path: p }, true)">{{ p }}</button>
+        </details>
       </div>
 
       <div class="meta">
@@ -169,6 +173,11 @@ video { width: 100%; height: 100%; display: block; background: #000; }
 h2 { margin: 0; font: 600 17px/1.35 var(--font-display); word-break: break-all; user-select: text; }
 .loc { display: block; max-width: 100%; margin-top: 3px; padding: 0; border: none; background: none; color: var(--text-3); font-size: 12px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .loc:hover { color: var(--accent-text); }
+.copies { margin-top: 4px; font-size: 12px; color: var(--text-3); }
+.copies summary { cursor: pointer; width: fit-content; }
+.copies summary:hover { color: var(--text-2); }
+.copies[open] { max-height: 96px; overflow-y: auto; }
+.copies .loc { margin-top: 2px; padding-left: 12px; }
 .meta { display: flex; flex-wrap: wrap; gap: 6px; flex: none; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px; border-radius: 6px; background: var(--raise); font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
 .chip i { width: 7px; height: 7px; border-radius: 4px; }

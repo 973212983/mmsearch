@@ -6,9 +6,10 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -61,6 +62,24 @@ CREATE TRIGGER IF NOT EXISTS items_fts_ad AFTER DELETE ON items BEGIN
 END;
 """
 
+# 两个字的中文词 trigram 索引不了：每个文件把正文里的所有中文二字组（去重、空格分隔）存一行（rowid = files.id），
+# 按文件查「这几个词都出现过」——人记得的往往是同一份文件里不在一处的几个词。只存索引不存原文。
+GRAMS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS grams_fts USING fts5(grams, content='', contentless_delete=1);
+CREATE TRIGGER IF NOT EXISTS files_grams_ad AFTER DELETE ON files BEGIN
+    DELETE FROM grams_fts WHERE rowid = old.id;
+END;
+"""
+_CJK = re.compile(r"[㐀-䶿一-鿿豈-﫿]+")
+
+
+def _bigrams(texts) -> str:
+    grams = set()
+    for t in texts:
+        for run in _CJK.findall(t or ""):
+            grams.update(run[i:i + 2] for i in range(len(run) - 1))
+    return " ".join(grams)
+
 
 @dataclass
 class Hit:
@@ -73,6 +92,7 @@ class Hit:
     snippet: str | None
     mtime: float | None = None
     lexical: bool = False  # 关键词命中（文件名或正文），score 里含 LEXICAL_BOOST 加分
+    copies: list[str] = field(default_factory=list)  # 内容相同（指纹一致）的其他文件，合并在这一条里
 
 
 def _normalize(m: np.ndarray) -> np.ndarray:
@@ -99,6 +119,16 @@ class VectorStore:
         if new_fts:  # 旧版索引库：给已有记录补上关键词索引
             self.db.execute("INSERT INTO paths_fts(paths_fts) VALUES ('rebuild')")
             self.db.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
+        new_grams = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='grams_fts'").fetchone()
+        self.db.executescript(GRAMS_SCHEMA)
+        if new_grams:  # 旧版索引库：给已有的文本补上二字组索引
+            fid, snippets = None, []
+            for f, s in self.db.execute("SELECT file_id, snippet FROM items WHERE kind='text' ORDER BY file_id"):
+                if f != fid:
+                    self._put_grams(fid, snippets)
+                    fid, snippets = f, []
+                snippets.append(s)
+            self._put_grams(fid, snippets)
         if not self.db.execute("SELECT 1 FROM meta WHERE key='pdf_scan'").fetchone():
             # 旧版把读不出文字的 PDF 记成「成功、0 条」，mtime 没变就不会再处理：删掉记录，下次扫描按扫描件重新处理
             self.db.execute("DELETE FROM files WHERE path LIKE '%.pdf' AND error IS NULL "
@@ -106,6 +136,8 @@ class VectorStore:
             self.db.execute("INSERT INTO meta(key, value) VALUES ('pdf_scan', '1')")
         self.db.commit()
         self.lock = threading.RLock()
+        self._hub_bank: np.ndarray | None = None  # hubs.bank_vectors()，模型就绪后设置
+        self._hub_center: tuple[float, int] | None = None  # (图片万能分的中位数, 算的时候有多少张图)
         self._load()
 
     # ---------- 内存索引 ----------
@@ -129,6 +161,7 @@ class VectorStore:
     def _set_mem(self, ids, kinds, full, coarse, fids):
         self._buf = [ids, kinds, full, coarse, fids]
         self._n = len(ids)
+        self._n_image = int(np.count_nonzero(kinds == "image"))
         self._positions = {int(item_id): pos for pos, item_id in enumerate(ids)}
         self._publish()
 
@@ -156,6 +189,7 @@ class VectorStore:
             for offset, item_id in enumerate(ids):
                 self._positions[int(item_id)] = n + offset
             self._n = n + m
+            self._n_image += sum(k == "image" for k in kinds)
             self._publish()
 
     def _remove_mem(self, item_ids):
@@ -168,6 +202,7 @@ class VectorStore:
                 pos = self._positions.pop(int(item_id), None)
                 if pos is None:
                     continue
+                self._n_image -= self._buf[1][pos] == "image"
                 last = self._n - 1
                 if pos != last:
                     moved_id = int(self._buf[0][last])
@@ -274,6 +309,7 @@ class VectorStore:
                         "INSERT INTO items(file_id, kind, start, end, snippet, vec) VALUES(?,?,?,?,?,?)",
                         [(fid, it["kind"], it.get("start"), it.get("end"), it.get("snippet"), v.tobytes())
                          for it, v in zip(items, vecs16)])
+                    self._put_grams(fid, [it.get("snippet") for it in items if it["kind"] == "text"])
                 self.db.commit()
             except Exception:
                 self.db.rollback()
@@ -285,6 +321,11 @@ class VectorStore:
                     (r[0] for r in self.db.execute("SELECT id FROM items WHERE file_id=? ORDER BY id", (fid,))),
                     dtype=np.int64, count=len(items))
                 self._append_mem(new_ids, [it["kind"] for it in items], vecs16, fid)
+
+    def _put_grams(self, fid: int | None, snippets: list[str]):
+        grams = _bigrams(snippets) if fid is not None else ""
+        if grams:
+            self.db.execute("INSERT INTO grams_fts(rowid, grams) VALUES (?, ?)", (fid, grams))
 
     def stats(self) -> dict:
         with self.lock:
@@ -356,10 +397,13 @@ class VectorStore:
     def search(self, q: np.ndarray, k: int = 50, kinds: set[str] | None = None,
                dedup_files: bool = True, exclude_path: str | None = None,
                lex: dict[int, float] | None = None, boost: float = config.LEXICAL_BOOST,
-               files: np.ndarray | None = None) -> list[Hit]:
-        """两阶段检索：256d 粗排 → 768d 精排。q: (768,) 已归一化。exclude_path：排除查询文件自身（找相似）。
+               files: np.ndarray | None = None, exclude_hash: str | None = None, hub: float = 0.0) -> list[Hit]:
+        """两阶段检索：256d 粗排 → 768d 精排。q: (768,) 已归一化。
+        exclude_path：排除查询文件自身（找相似），内容和它相同的副本也排除；查询文件不在索引里时由
+        exclude_hash 给出它的指纹。dedup_files 时内容相同的文件合并成一条（Hit.copies）。
         lex：lexical(文字查询) 的结果，命中的条目（不在向量候选里的也补进来）得分加 boost × 命中强度。
-        各类型标签共用同一个查询，lex 只需算一次。files：filter_files() 的结果，只在这些文件里找。"""
+        各类型标签共用同一个查询，lex 只需算一次。files：filter_files() 的结果，只在这些文件里找。
+        hub：图片得分减去 hub × 万能分（见 hubs.py），只用于含文字的查询。"""
         q = np.asarray(q, dtype=np.float32).reshape(-1)
         lex = lex if boost > 0 else None
         with self.lock:
@@ -382,12 +426,37 @@ class VectorStore:
                     pos = pos[mask[pos]]
                 cand = np.union1d(cand, pos)
                 bonus = boost * np.array([lex.get(int(i), 0.0) for i in ids[cand]], np.float32)
-            fine = full[cand].astype(np.float32) @ q + bonus
+            cand_full = full[cand].astype(np.float32)
+            fine = cand_full @ q + bonus
+            center = self._hub_median() if hub > 0 else None
+            if center is not None:
+                img = item_kinds[cand] == "image"
+                fine[img] -= hub * ((cand_full[img] @ self._hub_bank.T).mean(1) - center)
             fine_order = np.argsort(-fine)
             ordered_ids = ids[cand[fine_order]].copy()
             ordered_scores = fine[fine_order].copy()
             ordered_lex = bonus[fine_order] > 0
-        return self._hits(ordered_ids, ordered_scores, k, dedup_files, exclude_path, ordered_lex)
+        return self._hits(ordered_ids, ordered_scores, k, dedup_files, exclude_path, ordered_lex,
+                          fold=dedup_files, exclude_hash=exclude_hash)
+
+    def set_hub_bank(self, bank: np.ndarray | None):
+        """hubs.bank_vectors() 的结果；None 表示不做万能图修正。"""
+        with self.lock:
+            self._hub_bank = None if bank is None else np.asarray(bank, np.float32)
+            self._hub_center = None
+
+    def _hub_median(self) -> float | None:
+        """所有图片万能分的中位数（抽样）。图片数量变化超过一半时重算；图片太少时不修正，返回 None。"""
+        n = self._n_image
+        if self._hub_bank is None or n < config.HUB_MIN_IMAGES:
+            return None
+        if self._hub_center is None or not (self._hub_center[1] / 1.5 <= n <= self._hub_center[1] * 1.5):
+            pos = np.flatnonzero(self.kinds == "image")
+            if len(pos) > 20000:
+                pos = np.random.default_rng(0).choice(pos, 20000, replace=False)
+            raw = (self.full[pos].astype(np.float32) @ self._hub_bank.T).mean(1)
+            self._hub_center = (float(np.median(raw)), n)
+        return self._hub_center[0]
 
     def similar_groups(self, threshold: float, kinds: set[str] | None = None, limit: int = 300) -> list[list[Hit]]:
         """相似的图片分组：图片向量两两余弦 ≥ threshold 的连成一组，每组按文件去重。
@@ -507,8 +576,10 @@ class VectorStore:
         - 文件：所有词都出现在路径里、且至少一个词在文件名里（「项目A 报价」这样带上文件夹也能找到）。
           强度看查询词占文件名主干的比例（搜的就是这个文件名时为 1），以及命中的文件少不少（单号、编号这类
           只有一两个文件含有的词也算精确命中），取较大者。
-        trigram 只能索引 3 个字符以上的词：有长词时用 FTS 查，短词（如两个字的中文词）只在路径上补充过滤；
-        全是短词时只在路径里做子串扫描（路径表小，扫描很快），不查正文。"""
+        - 两个字的中文词：trigram 只能索引 3 个字符以上的词，这类词在正文里按文件查（grams_fts）：
+          所有两字词都在这个文件里出现过（有长词时长词也要出现），强度看命中的文件少不少，
+          常见词组合命中的文件多、加分就小。其他短词（单个汉字、两个字母）只在路径上过滤。
+        全是短词时路径只做子串扫描（路径表小，扫描很快）。"""
         # 单个英文字母/数字几乎每个路径都有，不算关键词
         terms = list(dict.fromkeys(t.lower() for t in text.split() if len(t) > 1 or not t.isascii()))
         long_terms = [t for t in terms if len(t) >= 3]
@@ -516,9 +587,10 @@ class VectorStore:
             return {}
         n = config.LEXICAL_CANDIDATES
         out: dict[int, float] = {}
+        quote = lambda ts: " AND ".join('"' + t.replace('"', '""') + '"' for t in ts)
         with self.lock:
             if long_terms:
-                match = " AND ".join('"' + t.replace('"', '""') + '"' for t in long_terms)
+                match = quote(long_terms)
                 paths = self.db.execute("SELECT rowid, path FROM paths_fts WHERE paths_fts MATCH ? LIMIT ?",
                                         (match, n * 4)).fetchall()
                 rows = self.db.execute("SELECT rowid, bm25(items_fts) FROM items_fts WHERE items_fts MATCH ? "
@@ -537,25 +609,46 @@ class VectorStore:
                 in_name = [t for t in terms if t in name]
                 if in_name and all(t in path for t in terms):
                     files[fid] = sum(map(len, in_name)) / max(len(os.path.splitext(name)[0]), 1)
+            strength = {}
             if files:
                 specific = 3 / len(files)
-                fids = list(files)
+                strength = {fid: min(1.0, max(s, specific, 0.2)) for fid, s in files.items()}
+            pairs = [t for t in terms if len(t) == 2 and _CJK.fullmatch(t)]
+            if pairs:
+                found = {r[0] for r in self.db.execute("SELECT rowid FROM grams_fts WHERE grams_fts MATCH ?",
+                                                       (quote(pairs),))}
+                if found and long_terms:
+                    found &= {r[0] for r in self.db.execute(
+                        "SELECT DISTINCT file_id FROM items WHERE id IN "
+                        "(SELECT rowid FROM items_fts WHERE items_fts MATCH ?)", (match,))}
+                if 0 < len(found) <= n * 4:
+                    for fid in found:
+                        strength[fid] = max(strength.get(fid, 0.0), min(1.0, 3 / len(found)))
+            if strength:
+                fids = list(strength)
                 q = ",".join("?" * len(fids))
                 for iid, fid in self.db.execute(f"SELECT id, file_id FROM items WHERE file_id IN ({q})", fids):
-                    out[iid] = max(out.get(iid, 0.0), min(1.0, max(files[fid], specific, 0.2)))
+                    out[iid] = max(out.get(iid, 0.0), strength[fid])
         return out
 
-    def _hits(self, item_ids, scores, k, dedup_files, exclude_path=None, lexical=None) -> list[Hit]:
+    def _hits(self, item_ids, scores, k, dedup_files, exclude_path=None, lexical=None,
+              fold=False, exclude_hash=None) -> list[Hit]:
+        """fold：内容相同（指纹一致）的文件只保留排在最前的一条，其余路径记在 Hit.copies。
+        exclude_hash：和查询文件内容相同的也排除（没给时按 exclude_path 在索引里查）。"""
         out, seen = [], set()
         id_list = [int(i) for i in item_ids]
         if not id_list:
             return out
         q = ",".join("?" * len(id_list))
+        skip = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else None
         with self.lock:
             rows = {r[0]: r for r in self.db.execute(
-                f"SELECT items.id, files.path, items.kind, items.start, items.end, items.snippet, files.id, files.mtime "
-                f"FROM items JOIN files ON files.id=items.file_id WHERE items.id IN ({q})", id_list)}
-        skip = os.path.normcase(os.path.abspath(exclude_path)) if exclude_path else None
+                f"SELECT items.id, files.path, items.kind, items.start, items.end, items.snippet, files.id, files.mtime, "
+                f"files.hash FROM items JOIN files ON files.id=items.file_id WHERE items.id IN ({q})", id_list)}
+            if skip and exclude_hash is None:
+                r = self.db.execute("SELECT hash FROM files WHERE path=?", (os.path.abspath(exclude_path),)).fetchone()
+                exclude_hash = r and r[0]
+        by_hash: dict[str, Hit] = {}
         for i, (iid, s) in enumerate(zip(id_list, scores)):
             r = rows.get(iid)
             if r is None:
@@ -563,9 +656,23 @@ class VectorStore:
             if dedup_files and r[6] in seen:
                 continue
             seen.add(r[6])
-            if skip and os.path.normcase(r[1]) == skip:
+            if skip and (os.path.normcase(r[1]) == skip or (exclude_hash and r[8] == exclude_hash)):
+                continue
+            if fold and r[8] in by_hash:
                 continue
             out.append(Hit(iid, float(s), r[1], r[2], r[3], r[4], r[5], r[7], bool(lexical is not None and lexical[i])))
+            if fold and r[8]:
+                by_hash[r[8]] = out[-1]
             if len(out) >= k:
                 break
+        if by_hash:  # 副本列全（不只是排进候选的那些）
+            hs = list(by_hash)
+            with self.lock:
+                for s in range(0, len(hs), 500):
+                    part = hs[s: s + 500]
+                    for fp, path in self.db.execute(
+                            f"SELECT hash, path FROM files WHERE hash IN ({','.join('?' * len(part))}) "
+                            f"AND error IS NULL ORDER BY path", part):
+                        if path != by_hash[fp].path:
+                            by_hash[fp].copies.append(path)
         return out

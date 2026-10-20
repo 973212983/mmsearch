@@ -161,6 +161,10 @@ LEXICAL_BOOST = 0.1
 LEXICAL_CANDIDATES = 50  # 正文关键词命中取 bm25 最好的前 N 条
 # 以图搜索后补充文字（组合查询）：文字向量的权重，其余是图片向量
 COMPOSE_TEXT_WEIGHT = 0.5
+# 「万能图」修正（见 hubs.py）：含文字的查询里图片得分减去 HUB_PENALTY × 万能分。实测 0.25–1.0 效果相同，
+# 1.5 开始伤到以图加文字。图片少于 HUB_MIN_IMAGES 张时中位数不可靠，不修正
+HUB_PENALTY = 0.5
+HUB_MIN_IMAGES = 100
 # 整理图片：「几乎相同」（副本、缩放、重新压缩）按 dHash 汉明距离分组。实测缩小到 1/4 再 JPEG q50 压缩最多差 6 位，
 # 随机两张不同的图 2000 对里只有 1 对 ≤8（还是两张空白图，现在纯色图不参与比较）
 DHASH_SAME_MAX = 8
